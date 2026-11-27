@@ -75,14 +75,21 @@ class Ball:
 
 class FootballModel(mesa.Model):
 
-    def __init__(self, seed=None, verbose=True, architecture="BDI",
-                 commitment="single"):
-        """architecture : "REACTIVE" (TP 1 : automate + regles) ou "BDI" (TP 2)
+    def __init__(self, seed=None, verbose=True, architecture="BDI_PLAN",
+                 commitment="single", plan_mode="closed"):
+        """architecture : "REACTIVE" (TP 1 : automate + regles)
+                          "BDI"      (TP 2 : croyances, desirs, intentions)
+                          "BDI_PLAN" (TP 3 : BDI + planification)
         commitment   : engagement BDI, "blind", "single" ou "open"
+        plan_mode    : "closed" (verifie le plan a chaque tick et replanifie)
+                       ou "open" (execute la sequence prevue sans verifier)
         """
         super().__init__(rng=seed)
         self.architecture = architecture
         self.commitment = commitment
+        self.planning = architecture in ("BDI_PLAN", "HYBRID")
+        self.plan_mode = plan_mode
+        self.team_plans = {}     # {equipe: TeamPlan} plan d'equipe partage
         self.verbose = verbose   # affiche les evenements (prises, buts)
         # journal des joueurs : True / False, ou un ensemble de noms de joueurs
         self.trace = verbose
@@ -94,6 +101,9 @@ class FootballModel(mesa.Model):
         self.total_passes = 0
         self.successful_passes = 0
         self.total_shots = 0
+        self.team_shots = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
+        self.total_replans = 0
+        self.plans_created = 0
 
         formations = {LEFT_TEAM: FORMATION_A, RIGHT_TEAM: FORMATION_B}
         for team, formation in formations.items():
@@ -132,6 +142,14 @@ class FootballModel(mesa.Model):
     def give_ball(self, player):
         self.ball.owner = player
         self.ball.follow_owner()
+        self.clear_stale_plans()
+
+    def clear_stale_plans(self):
+        """Un plan d'equipe n'a plus de sens si l'equipe a perdu le ballon."""
+        owner = self.ball.owner
+        for team in list(self.team_plans):
+            if owner is None or owner.team != team:
+                del self.team_plans[team]
 
     def resolve_ball(self):
         """Prise d'un ballon libre ou tacle sur le porteur."""
@@ -161,6 +179,7 @@ class FootballModel(mesa.Model):
         y = min(max(pos[1], 0.0), FIELD_H - 1e-6)
         self.ball.owner = None
         self.ball.pos = (x, y)
+        self.clear_stale_plans()
 
     def attempt_pass(self, passer, receiver):
         """Passe instantanee de `passer` vers `receiver`.
@@ -202,6 +221,7 @@ class FootballModel(mesa.Model):
         Renvoie "GOAL" ou "SHOT_MISSED".
         """
         self.total_shots += 1
+        self.team_shots[shooter.team] += 1
         goal = self.opponent_goal(shooter.team)
         dist = distance(shooter.pos, goal)
         p_goal = max(0.05, 0.75 - dist / SHOT_RANGE_SCALE)
@@ -239,6 +259,7 @@ class FootballModel(mesa.Model):
             self.space.move_agent(p, p.home)
         self.ball.owner = None
         self.ball.pos = (FIELD_W / 2, FIELD_H / 2)
+        self.team_plans.clear()
 
     # ----------------------------------------------------------------- cycle
     def step(self):

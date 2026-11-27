@@ -23,6 +23,9 @@ import math
 import mesa
 
 from beliefs import ENVIRONMENT, PERSONAL, RELATIONAL, SOCIAL, BeliefBase
+from planning import (GOAL, HAS_BALL, MATE_FREE, NO_PRESSURE, ZONE_ORDER,
+                      PlannedAction, TeamPlan, bfs_plan, resolve_conflicts,
+                      short, states_along, zone_of)
 
 # --- Deplacement -------------------------------------------------------------
 SPEED = 1.0              # metres parcourus par tick sans ballon
@@ -44,6 +47,14 @@ SIDELINE_MARGIN = 0.5     # trop pres de la ligne de touche
 SHOOT_RANGE = 16.5        # distance au but pour tirer (surface de reparation)
 PROGRESS_GOAL = 10.0      # PROGRESS est satisfaite apres 10 m gagnes
 OPEN_MARGIN = 15.0        # engagement ouvert : changer si un desir vaut +15
+
+# --- Planification (TP 3) ----------------------------------------------------
+AHEAD_MARGIN = 8.0        # MATE_FREE : coequipier libre au moins 8 m plus haut
+RUN_DEPTH = 12.0          # une course vise 12 m devant le porteur...
+RUN_WIDTH = 10.0          # ... decalee de 10 m sur le cote
+RUN_DONE_DIST = 3.0       # course terminee a moins de 3 m de la cible
+PLAN_SLACK = 15           # retard tolere sur une etape avant de replanifier
+ZONE_CELL = (15.0, 17.0)  # taille d'une "zone de reception" (ressource)
 
 
 # =============================================================================
@@ -97,6 +108,10 @@ class PlayerAgent(mesa.Agent):
         self.intentions_dropped = 0
         self.intentions_achieved = 0
 
+        # --- Planification (TP 3) ---
+        self.pending_plan_step = None      # etape de plan en cours d'execution
+        self.replans = 0
+
         # --- Explicabilite ---
         self.last_module = None
         self.last_rule = None
@@ -135,6 +150,7 @@ class PlayerAgent(mesa.Agent):
 
         # ... la deliberation tourne a chaque tick (le BDI continue de
         # suivre ses intentions), mais sa sortie est inhibee en cas d'urgence.
+        self.pending_plan_step = None
         decision = self.deliberative_layer()
 
         if urgent is not None:
@@ -144,7 +160,8 @@ class PlayerAgent(mesa.Agent):
             self.execute(urgent)
         else:
             self.inhibited_decision = None
-            self.execute(decision)
+            result = self.execute(decision)
+            self.finish_plan_step(self.pending_plan_step, result)
 
         self.log_tick()
 
@@ -196,6 +213,8 @@ class PlayerAgent(mesa.Agent):
              else "MEDIUM" if nearest_opp_dist < PRESSURE_MEDIUM else "LOW",
              RELATIONAL),
             ("best_mate", self.find_best_teammate(mates, opponents), RELATIONAL),
+            ("free_mates", frozenset(m.name for m in self.free_teammates(
+                mates, opponents)), RELATIONAL),
             ("mate_too_close", closest_mate, RELATIONAL),
             ("closest_mate_to_ball",
              all(m.distance_to(ball_pos) >= dist_ball for m in mates), RELATIONAL),
@@ -236,11 +255,15 @@ class PlayerAgent(mesa.Agent):
             self.tick_revisions.append(revision)
         return revision
 
-    def find_best_teammate(self, mates, opponents):
-        """Coequipier visible, libre (aucun adversaire a moins de FREE_MARGIN)
-        et le plus avance vers le but adverse."""
-        free = [m for m in mates
+    @staticmethod
+    def free_teammates(mates, opponents):
+        """Coequipiers visibles sans adversaire visible a moins de FREE_MARGIN."""
+        return [m for m in mates
                 if all(o.distance_to(m.pos) >= FREE_MARGIN for o in opponents)]
+
+    def find_best_teammate(self, mates, opponents):
+        """Coequipier visible, libre et le plus avance vers le but adverse."""
+        free = self.free_teammates(mates, opponents)
         if not free:
             return None
         return max(free, key=lambda m: self.forward(m.pos[0]))
@@ -287,7 +310,7 @@ class PlayerAgent(mesa.Agent):
     # =================================================================
     def deliberative_layer(self):
         self.transition_state()
-        if self.model.architecture == "BDI":
+        if self.model.architecture != "REACTIVE":
             return self.bdi_deliberation()
         if self.belief("has_ball"):
             return self.production_decision()
@@ -317,13 +340,20 @@ class PlayerAgent(mesa.Agent):
 
     # --- 2.4 Desirs -------------------------------------------------------
     def generate_desires(self):
+        # TP 3 : une tache attribuee par le plan d'equipe devient un desir
+        # (sauf pour qui poursuit deja CREATE_SHOT : il execute son plan).
+        plan_task = (["FOLLOW_PLAN"] if self.assigned_plan_step()
+                     and self.intention != "CREATE_SHOT" else [])
         if self.belief("has_ball"):
-            return ["SCORE", "KEEP_POSSESSION", "PROGRESS"]
+            desires = ["SCORE", "KEEP_POSSESSION", "PROGRESS"]
+            if self.model.planning:
+                desires.append("CREATE_SHOT")
+            return desires + plan_task
         owner = self.belief("ball_owner")
         if owner is None:
             return ["RECOVER_BALL"]
         if owner.team == self.team:
-            return ["OFFER_SUPPORT", "CREATE_SPACE"]
+            return ["OFFER_SUPPORT", "CREATE_SPACE"] + plan_task
         return ["RECOVER_BALL", "PROTECT_GOAL"]
 
     def utility(self, goal):
@@ -343,6 +373,11 @@ class PlayerAgent(mesa.Agent):
             return 50.0
         if goal == "CREATE_SPACE":
             return 60.0 if b("pressure") == "HIGH" else 30.0
+        if goal == "CREATE_SHOT":
+            # hors de la surface : il faut plusieurs actions -> un plan
+            return 0.0 if b("goal_dist") < SHOOT_RANGE else 65.0
+        if goal == "FOLLOW_PLAN":
+            return 90.0
         return 0.0
 
     # --- 2.5 Deliberation et engagement -----------------------------------
@@ -353,6 +388,17 @@ class PlayerAgent(mesa.Agent):
         - "open"   : on la garde tant qu'elle reste pertinente, c'est-a-dire
                      encore desiree et pas nettement depassee par un autre desir.
         """
+        # Une tache recue du plan d'equipe est un evenement nouveau : elle
+        # declenche une reconsideration, quel que soit l'engagement.
+        utilities = dict(self.desires)
+        if "FOLLOW_PLAN" in utilities and self.intention not in (
+                "FOLLOW_PLAN", None):
+            self.bdi_events.append(
+                f"tache recue du plan d'equipe : {self.intention} reconsideree")
+            self.adopt("FOLLOW_PLAN", "tache attribuee par le plan")
+            self.note_rejected_desires("tache prioritaire")
+            return self.intention
+
         if self.intention is not None and self.keep_intention():
             self.note_rejected_desires("intention maintenue")
             return self.intention
@@ -403,6 +449,7 @@ class PlayerAgent(mesa.Agent):
         self.intention_context = {
             "tick": self.model.steps,
             "score": self.model.score[self.team],
+            "shots": self.model.team_shots[self.team],
             "ball_x": self.forward(self.belief("ball_position")[0]),
         }
         self.bdi_events.append(
@@ -430,6 +477,11 @@ class PlayerAgent(mesa.Agent):
             return owner is None or my_team_has_ball
         if i == "HOLD_POSITION":
             return True
+        if i == "CREATE_SHOT":
+            return self.model.team_shots[self.team] > self.intention_context["shots"]
+        if i == "FOLLOW_PLAN":
+            plan = self.model.team_plans.get(self.team)
+            return plan is not None and not plan.pending_for(self.name)
         return False
 
     def intention_possible(self):
@@ -439,8 +491,11 @@ class PlayerAgent(mesa.Agent):
             return b("has_ball")
         if i == "RECOVER_BALL":
             return owner is None or owner.team != self.team
-        if i in ("OFFER_SUPPORT", "CREATE_SPACE"):
+        if i in ("OFFER_SUPPORT", "CREATE_SPACE", "CREATE_SHOT"):
             return owner is not None and owner.team == self.team
+        if i == "FOLLOW_PLAN":
+            return (owner is not None and owner.team == self.team
+                    and self.assigned_plan_step() is not None)
         return True
 
     def drop_achieved_intentions(self):
@@ -491,7 +546,259 @@ class PlayerAgent(mesa.Agent):
             return ("CREATE_SPACE", None)
         if i == "PROTECT_GOAL":
             return ("DEFEND_ZONE", None)
+        if i in ("CREATE_SHOT", "FOLLOW_PLAN"):
+            return self.plan_action()
         return ("GO_HOME", None)
+
+    # =================================================================
+    # TP 3  PLANIFICATION
+    # =================================================================
+    def assigned_plan_step(self):
+        """Prochaine etape du plan d'equipe confiee a ce joueur, ou None."""
+        plan = self.model.team_plans.get(self.team)
+        if plan is None:
+            return None
+        pending = plan.pending_for(self.name)
+        return pending[0] if pending else None
+
+    # --- 3.1 Etat symbolique, vu par le porteur ---------------------------
+    def symbolic_state(self):
+        state = set()
+        owner = self.belief("ball_owner")
+        if owner is not None and owner.team == self.team:
+            state.add(HAS_BALL)
+        ball_zone = zone_of(self.ball_goal_dist())
+        state.add(ball_zone)
+        if self.belief("pressure") != "HIGH":
+            state.add(NO_PRESSURE)
+        if self.free_mate_ahead(self.belief("best_mate")):
+            state.add(MATE_FREE)
+        return frozenset(state)
+
+    def free_mate_ahead(self, mate):
+        """Coequipier visible, libre et au moins AHEAD_MARGIN plus haut."""
+        return (mate is not None
+                and mate.name in self.belief("free_mates")
+                and self.forward(mate.pos[0]) >= self.forward(self.pos[0]) + AHEAD_MARGIN)
+
+    def goal_dist_of(self, pos):
+        goal = self.model.opponent_goal(self.team)
+        return math.hypot(pos[0] - goal[0], pos[1] - goal[1])
+
+    def ball_goal_dist(self):
+        return self.goal_dist_of(self.belief("ball_position"))
+
+    # --- Execution du plan (boucle fermee ou ouverte) ---------------------
+    def plan_action(self):
+        plan = self.model.team_plans.get(self.team)
+        if self.belief("has_ball"):
+            plan = self.maintain_plan(plan)
+            if plan is None:
+                return ("DRIBBLE", None)
+        elif plan is not None:
+            self.advance_plan(plan, None)
+            plan = self.model.team_plans.get(self.team)
+
+        step = plan.current() if plan else None
+        if step is not None and step.actor_id == self.name:
+            return self.concrete_step(step)
+        if self.belief("has_ball"):
+            # attendre qu'un coequipier termine sa tache (synchronisation)
+            return ("PROTECT_BALL", None) if self.belief("pressure") == "HIGH" \
+                else ("HOLD", None)
+        owner = self.belief("ball_owner")
+        if owner is not None and owner.team == self.team:
+            return ("SUPPORT", owner)
+        return ("MOVE_TO_BALL", None)
+
+    def maintain_plan(self, plan):
+        """Le porteur fait avancer le plan, verifie qu'il est encore valide
+        et replanifie sinon (boucle fermee)."""
+        state = self.symbolic_state()
+        if plan is not None:
+            self.advance_plan(plan, state)
+            plan = self.model.team_plans.get(self.team)
+
+        problem = self.plan_problem(plan, state)
+        if problem is None:
+            return plan
+        if plan is not None:
+            self.replans += 1
+            self.model.total_replans += 1
+            self.bdi_events.append(f"plan invalide : {problem} -> replanification")
+        return self.make_plan(state)
+
+    def plan_problem(self, plan, state):
+        if plan is None:
+            return "aucun plan"
+        step = plan.current()
+        if step is None:
+            return "plan termine"
+        if step.kind in ("DRIBBLE", "PASS", "SHOOT") and step.actor_id != self.name:
+            return f"le porteur devait etre {step.actor_id}"
+        if self.model.plan_mode == "open":
+            return None   # boucle ouverte : on execute la sequence prevue
+        missing = step.schema.preconditions - state
+        if missing:
+            return f"{step.name} : precondition(s) {sorted(missing)} fausse(s)"
+        if step.kind == "PASS" and step.target_id not in self.belief("free_mates"):
+            return f"le receveur {step.target_id} n'est plus libre"
+        if self.model.steps - plan.step_started > step.duration + PLAN_SLACK:
+            return f"{step.name} en retard"
+        return None
+
+    def advance_plan(self, plan, state):
+        """Passe les etapes deja realisees (conduite ou course terminee)."""
+        while not plan.finished():
+            step = plan.current()
+            if step.kind == "DRIBBLE" and state is not None:
+                zones = set(ZONE_ORDER)
+                target_zone = next(iter(step.schema.add_effects & zones))
+                ball_zone = next(iter(state & zones))
+                done = ZONE_ORDER[ball_zone] >= ZONE_ORDER[target_zone]
+            elif step.kind == "RUN":
+                # terminee si le coureur est arrive, ou si le porteur le voit
+                # deja libre et place plus haut que lui
+                runner = self.model.get_player(step.actor_id)
+                done = (runner.distance_to(step.target_pos) < RUN_DONE_DIST
+                        or (state is not None and self.free_mate_ahead(runner)))
+            else:
+                done = False
+            if not done:
+                break
+            self.bdi_events.append(f"etape terminee : {step.describe()}")
+            plan.advance(self.model.steps)
+        if plan.finished():
+            self.model.team_plans.pop(self.team, None)
+
+    def concrete_step(self, step):
+        if step.kind == "DRIBBLE":
+            return ("DRIBBLE", None)
+        if step.kind == "RUN":
+            return ("RUN_TO", step.target_pos)
+        self.pending_plan_step = step
+        if step.kind == "PASS":
+            return ("PASS", self.model.get_player(step.target_id))
+        return ("SHOOT", None)
+
+    def finish_plan_step(self, step, result):
+        """Apres une passe ou un tir prevus par le plan."""
+        if step is None:
+            return
+        plan = self.model.team_plans.get(self.team)
+        if plan is not None and plan.current() is step and result in (
+                "PASS_OK", "GOAL", "SHOT_MISSED"):
+            self.bdi_events.append(f"etape terminee : {step.describe()} => {result}")
+            plan.advance(self.model.steps)
+            if plan.finished():
+                self.model.team_plans.pop(self.team, None)
+
+    # --- 3.3 Planifier, puis 3.5 allouer les actions aux joueurs ----------
+    def make_plan(self, state):
+        schemas = bfs_plan(state, lambda s: GOAL <= s)
+        if not schemas:
+            self.bdi_events.append(f"aucun plan trouve depuis {short(state)}")
+            return None
+        steps = self.allocate(schemas)
+        if steps is None:
+            self.bdi_events.append("plan trouve mais aucun coequipier disponible")
+            return None
+        steps, resolutions = resolve_conflicts(steps, "reallocate",
+                                               self.free_reception_zone)
+        plan = TeamPlan("CREATE_SHOT", steps, states_along(state, schemas),
+                        author=self.name, created_tick=self.model.steps,
+                        step_started=self.model.steps)
+        self.model.team_plans[self.team] = plan
+        self.model.plans_created += 1
+
+        chain = f"s0 {short(plan.states[0])}"
+        for k, sc in enumerate(schemas, start=1):
+            chain += f" --{sc.name}--> s{k} {short(plan.states[k])}"
+        self.bdi_events.append(f"plan cree (BFS, {len(schemas)} actions) : {chain}")
+        self.bdi_events.append(
+            "allocation : " + " | ".join(s.describe() for s in steps))
+        for r in resolutions:
+            self.bdi_events.append(f"conflit resolu : {r}")
+        return plan
+
+    def allocate(self, schemas):
+        """Associe chaque action symbolique a un executant, une date au plus
+        tot et une zone de reception (pour les courses)."""
+        now = self.model.steps
+        t = now
+        carrier = self
+        runner = None
+        busy = set()
+        steps = []
+        for sc in schemas:
+            if sc.kind == "RUN":
+                choice = self.choose_runner(carrier, busy)
+                if choice is None:
+                    return None
+                runner, target = choice
+                busy.add(runner.name)
+                duration = math.ceil(runner.distance_to(target) / SPEED)
+                steps.append(PlannedAction(
+                    runner.name, sc.name, earliest_tick=t, duration=duration,
+                    resource=self.zone_id(target), target_pos=target, schema=sc))
+                t += duration
+            elif sc.kind == "PASS":
+                receiver = runner if runner is not None else self.belief("best_mate")
+                if receiver is None:
+                    return None
+                steps.append(PlannedAction(carrier.name, sc.name,
+                                           target_id=receiver.name,
+                                           earliest_tick=t, schema=sc))
+                carrier, runner = receiver, None
+                t += 1
+            elif sc.kind == "DRIBBLE":
+                duration = math.ceil(18.5 / SPEED_WITH_BALL)
+                steps.append(PlannedAction(carrier.name, sc.name, earliest_tick=t,
+                                           duration=duration, schema=sc))
+                t += duration
+            else:
+                steps.append(PlannedAction(carrier.name, sc.name, earliest_tick=t,
+                                           schema=sc))
+                t += 1
+        return steps
+
+    def choose_runner(self, carrier, busy):
+        """Allocation selon les savoir-faire : on prefere un attaquant, puis le
+        coequipier le plus proche de la zone d'appel. Le planificateur connait
+        la position de ses coequipiers (connaissance d'equipe, simplification)."""
+        mates = [m for m in self.model.players(self.team)
+                 if m is not carrier and m.name not in busy]
+        if not mates:
+            return None
+        # La course reste dans le champ de perception du porteur (12 m devant,
+        # 10 m sur le cote) pour que MATE_FREE puisse devenir vrai.
+        direction = self.model.attack_direction(self.team)
+        x = carrier.pos[0] + RUN_DEPTH * direction
+        x = min(max(x, 3.0), self.model.space.x_max - 3.0)
+
+        def target_for(mate):
+            side = RUN_WIDTH if mate.pos[1] >= carrier.pos[1] else -RUN_WIDTH
+            y = min(max(carrier.pos[1] + side, 3.0), self.model.space.y_max - 3.0)
+            return (x, y)
+
+        runner = min(mates, key=lambda m: (m.role != "ATT",
+                                           m.distance_to(target_for(m))))
+        return runner, target_for(runner)
+
+    def zone_id(self, pos):
+        return (int(pos[0] // ZONE_CELL[0]), int(pos[1] // ZONE_CELL[1]))
+
+    def free_reception_zone(self, step, taken):
+        """Reallocation : une autre zone de reception, libre, pres de la cible."""
+        x, y = step.target_pos
+        for dx, dy in ((0, ZONE_CELL[1]), (0, -ZONE_CELL[1]),
+                       (ZONE_CELL[0], 0), (-ZONE_CELL[0], 0)):
+            pos = (min(max(x + dx, 3.0), self.model.space.x_max - 3.0),
+                   min(max(y + dy, 3.0), self.model.space.y_max - 3.0))
+            zone = self.zone_id(pos)
+            if zone not in taken:
+                return zone, pos
+        return step.resource, step.target_pos
 
     # =================================================================
     # TP 1.3  Regles de production (architecture "REACTIVE", porteur)
@@ -563,6 +870,8 @@ class PlayerAgent(mesa.Agent):
             self.create_space()
         elif name == "GO_HOME":
             self.move_toward(self.home)
+        elif name == "RUN_TO":
+            self.move_toward(arg)
         elif name == "PASS":
             result = self.model.attempt_pass(self, arg)
         elif name == "SHOOT":
@@ -669,7 +978,7 @@ class PlayerAgent(mesa.Agent):
     def log_tick(self):
         if not self.traced():
             return
-        if self.model.architecture == "BDI":
+        if self.model.architecture != "REACTIVE":
             self.log_bdi()
         else:
             self.log_reactive()
@@ -681,6 +990,8 @@ class PlayerAgent(mesa.Agent):
     def _action_text(self):
         name, arg = self.last_action
         text = name + (f"->{arg.name}" if isinstance(arg, PlayerAgent) else "")
+        if name == "RUN_TO":
+            text += f"({arg[0]:.0f},{arg[1]:.0f})"
         if self.last_result:
             text += f" => {self.last_result}"
         if self.inhibited_decision is not None:
@@ -716,3 +1027,6 @@ class PlayerAgent(mesa.Agent):
                 f"{rev.reason})")
         for event in self.bdi_events:
             self.model.log(f"{'':13}  {event}")
+        plan = self.model.team_plans.get(self.team)
+        if plan is not None and self.intention in ("CREATE_SHOT", "FOLLOW_PLAN"):
+            self.model.log(f"{'':13}  {plan.describe()}")
