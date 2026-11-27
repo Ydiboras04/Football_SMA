@@ -15,6 +15,14 @@ pip install -r requirements.txt
 ```bash
 python main.py          # un match complet
 python experiments.py   # scenarios controles (tests des TP)
+python experiments.py tp2
+```
+
+Le modele accepte deux architectures de joueur :
+
+```python
+FootballModel(architecture="REACTIVE")             # TP 1 : automate + regles
+FootballModel(architecture="BDI", commitment="single")  # TP 2 : "blind" | "single" | "open"
 ```
 
 ## Architecture du joueur (TP 1)

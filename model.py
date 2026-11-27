@@ -75,10 +75,17 @@ class Ball:
 
 class FootballModel(mesa.Model):
 
-    def __init__(self, seed=None, verbose=True):
+    def __init__(self, seed=None, verbose=True, architecture="BDI",
+                 commitment="single"):
+        """architecture : "REACTIVE" (TP 1 : automate + regles) ou "BDI" (TP 2)
+        commitment   : engagement BDI, "blind", "single" ou "open"
+        """
         super().__init__(rng=seed)
+        self.architecture = architecture
+        self.commitment = commitment
         self.verbose = verbose   # affiche les evenements (prises, buts)
-        self.trace = verbose     # affiche le journal de chaque joueur
+        # journal des joueurs : True / False, ou un ensemble de noms de joueurs
+        self.trace = verbose
         self.space = ContinuousSpace(FIELD_W, FIELD_H, torus=False)
         self.ball = Ball((FIELD_W / 2, FIELD_H / 2))
         self.score = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
