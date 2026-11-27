@@ -1,7 +1,9 @@
 import math
+import statistics
 from collections import Counter
 
 import mesa
+from mesa.datacollection import DataCollector
 from mesa.space import ContinuousSpace
 
 from agents import PlayerAgent
@@ -80,7 +82,7 @@ class FootballModel(mesa.Model):
 
     def __init__(self, seed=None, verbose=True, architecture="HYBRID",
                  commitment="single", plan_mode="closed",
-                 team_architectures=None, learners=None):
+                 team_architectures=None, learners=None, collect_data=False):
         """architecture : "REACTIVE" (TP 1 : automate + regles)
                           "BDI"      (TP 2 : croyances, desirs, intentions)
                           "BDI_PLAN" (TP 3 : BDI + planification)
@@ -89,7 +91,9 @@ class FootballModel(mesa.Model):
         team_architectures : {equipe: architecture} pour qu'une equipe joue
                        differemment de l'autre (ex. une equipe apprend contre
                        un adversaire a regles fixes)
-        learners     : {equipe: QLearner} partages d'un episode a l'autre
+        learners     : {equipe: QLearner} partages d'un episode a l'autre ;
+                       avec "HYBRID", un learner ajoute le Q-learning (TP 6)
+        collect_data : active le DataCollector de Mesa (une ligne par tick)
         commitment   : engagement BDI, "blind", "single" ou "open"
         plan_mode    : "closed" (verifie le plan a chaque tick et replanifie)
                        ou "open" (execute la sequence prevue sans verifier)
@@ -123,13 +127,46 @@ class FootballModel(mesa.Model):
         self.carrier_actions = {LEFT_TEAM: Counter(), RIGHT_TEAM: Counter()}
         self.ball_losses = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
         self.team_passes = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
+        self.team_successful_passes = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
         self.lateral_passes = {LEFT_TEAM: 0, RIGHT_TEAM: 0}  # gain < 5 m
+        # TP 6 / section 10 : indicateurs micro et macro
+        self.module_counts = {LEFT_TEAM: Counter(), RIGHT_TEAM: Counter()}
+        self.possession_ticks = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
+        self.recovery_times = {LEFT_TEAM: [], RIGHT_TEAM: []}
+        self.possession_gains = {LEFT_TEAM: [], RIGHT_TEAM: []}
+        self.dispersion_sum = {LEFT_TEAM: 0.0, RIGHT_TEAM: 0.0}
+        self._possessor = None          # equipe en possession au tick precedent
+        self._possession_start_x = 0.0
+        self._lost_at = {}
 
         formations = {LEFT_TEAM: FORMATION_A, RIGHT_TEAM: FORMATION_B}
         for team, formation in formations.items():
             for i, (role, home) in enumerate(formation, start=1):
                 player = PlayerAgent(self, team, role, name=f"{team}{i}", home=home)
                 self.space.place_agent(player, home)
+
+        # Collecte de metriques avec Mesa (listing 20 du sujet)
+        self.datacollector = None
+        if collect_data:
+            self.datacollector = DataCollector(
+                model_reporters={
+                    "score_a": lambda m: m.score[LEFT_TEAM],
+                    "score_b": lambda m: m.score[RIGHT_TEAM],
+                    "passes": lambda m: m.total_passes,
+                    "successful_passes": lambda m: m.successful_passes,
+                    "replans": lambda m: m.total_replans,
+                    "messages": lambda m: m.total_messages,
+                    "possession": lambda m: m._possessor,
+                },
+                agent_reporters={
+                    "team": "team",
+                    "role": "role",
+                    "intention": "intention",
+                    "last_action": lambda a: a.last_action[0] if a.last_action else None,
+                    "module": lambda a: (a.last_module or "").split(":")[0],
+                    "reward": "last_reward",
+                },
+            )
 
     def architecture_of(self, team):
         return self.team_architectures.get(team, self.architecture)
@@ -235,6 +272,7 @@ class FootballModel(mesa.Model):
         if self.random.random() < accuracy:
             self.give_ball(receiver)
             self.successful_passes += 1
+            self.team_successful_passes[passer.team] += 1
             self.log(f"passe {passer.name} -> {receiver.name} reussie")
             return "PASS_OK"
 
@@ -304,10 +342,81 @@ class FootballModel(mesa.Model):
         self.check_goal()
         # 4. les messages du tick seront lus au debut du tick suivant
         self.bus.deliver()
+        # 5. indicateurs
+        self.track_indicators()
+        if self.datacollector is not None:
+            self.datacollector.collect(self)
 
     @property
     def total_messages(self):
         return self.bus.total
+
+    # ------------------------------------------------------------ indicateurs
+    def track_indicators(self):
+        """Possession, temps de recuperation, progression du ballon par
+        possession et dispersion spatiale de chaque equipe."""
+        owner = self.ball.owner
+        team = owner.team if owner is not None else None
+        if team is not None:
+            self.possession_ticks[team] += 1
+        if team != self._possessor:
+            if self._possessor is not None:          # fin de possession
+                prev = self._possessor
+                gain = (self.ball.pos[0] * self.attack_direction(prev)
+                        - self._possession_start_x)
+                self.possession_gains[prev].append(gain)
+                self._lost_at[prev] = self.steps
+            if team is not None:                      # debut de possession
+                self._possession_start_x = self.ball.pos[0] * self.attack_direction(team)
+                if team in self._lost_at:
+                    self.recovery_times[team].append(self.steps - self._lost_at.pop(team))
+            self._possessor = team
+        for t in (LEFT_TEAM, RIGHT_TEAM):
+            players = self.players(t)
+            cx = sum(p.pos[0] for p in players) / len(players)
+            cy = sum(p.pos[1] for p in players) / len(players)
+            self.dispersion_sum[t] += sum(distance(p.pos, (cx, cy))
+                                          for p in players) / len(players)
+
+    def metrics(self, team):
+        """Indicateurs d'un episode pour une equipe (section 10)."""
+        opponent = RIGHT_TEAM if team == LEFT_TEAM else LEFT_TEAM
+        players = self.players(team)
+        on_ball = sum(self.carrier_actions[team][a] for a in ("PASS", "DRIBBLE", "SHOOT"))
+        dropped = sum(p.intentions_dropped for p in players)
+        finished = dropped + sum(p.intentions_achieved for p in players)
+        modules = self.module_counts[team]
+        total_modules = sum(modules.values()) or 1
+        learner = self.learners.get(team)
+        return {
+            # --- macro ---
+            "goals_for": self.score[team],
+            "goals_against": self.score[opponent],
+            "shots": self.team_shots[team],
+            "passes": self.team_passes[team],
+            "pass_success": (self.successful_passes_by(team)
+                             / max(self.team_passes[team], 1)),
+            "ball_progression": (statistics.mean(self.possession_gains[team])
+                                 if self.possession_gains[team] else 0.0),
+            "ball_losses": self.ball_losses[team],
+            "recovery_time": (statistics.mean(self.recovery_times[team])
+                              if self.recovery_times[team] else float("nan")),
+            "possession": self.possession_ticks[team] / max(self.steps, 1),
+            "dispersion": self.dispersion_sum[team] / max(self.steps, 1),
+            "reward": learner.total_reward if learner is not None else float("nan"),
+            # --- micro ---
+            "belief_revisions": sum(p.beliefs.revision_count for p in players),
+            "intention_changes": sum(p.intention_changes for p in players),
+            "dropped_rate": dropped / finished if finished else 0.0,
+            "replans": sum(p.replans for p in players),
+            "messages": sum(p.messages_sent for p in players),
+            "reactive_share": modules["REACTIVE"] / total_modules,
+            "q_share": modules["Q-LEARNING"] / total_modules,
+            "on_ball_actions": on_ball,
+        }
+
+    def successful_passes_by(self, team):
+        return self.team_successful_passes[team]
 
     def log(self, text):
         if self.verbose:

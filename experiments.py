@@ -683,6 +683,260 @@ def tp5_scenario_d():
     print(summary_line("corrige EVAL", good))
 
 
+# =============================================================================
+# TP 6 - Architecture hybride et experiences comparatives
+# =============================================================================
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import statistics  # noqa: E402
+
+TP6_TRAIN_SEEDS = range(0, 120)
+TP6_EVAL_SEEDS = range(2000, 2030)    # 30 episodes, memes graines pour tous
+CONFIGS = [  # (nom, architecture de REAL_MADRID, variante de Q-learning)
+    ("REACTIF", "REACTIVE", None),
+    ("BDI", "BDI", None),
+    ("BDI+PLAN", "BDI_PLAN", None),
+    ("HYBRIDE (TP4)", "HYBRID", None),
+    ("HYBRIDE+Q", "HYBRID", "q"),
+    ("HYBRIDE+Q naif", "HYBRID", "q_naive"),
+]
+# variante -> (episodes d'entrainement, marge d'arbitrage)
+Q_VARIANTS = {"q": (120, 2.0), "q_naive": (40, 0.0)}
+
+
+def tp6_episode(seed, architecture, learner=None, opponent="REACTIVE",
+                collect_data=False, margin=None):
+    from agents import PlayerAgent
+    if margin is not None:
+        PlayerAgent.Q_MARGIN = margin
+    if learner is not None:
+        learner.reset_stats()
+    m = FootballModel(seed=seed, verbose=False, collect_data=collect_data,
+                      team_architectures={RM: architecture, BA: opponent},
+                      learners={RM: learner} if learner is not None else {})
+    for _ in range(EPISODE_TICKS):
+        m.step()
+    return m
+
+
+def train_hybrid_learner(n_episodes, margin):
+    """Entrainement de HYBRIDE+Q sur des episodes separes (epsilon 0.5 -> 0.05)."""
+    learner = QLearner(seed=0)
+    for k, seed in enumerate(TP6_TRAIN_SEEDS[:n_episodes]):
+        learner.epsilon = epsilon_schedule("decay", k, n_episodes)
+        tp6_episode(seed, "HYBRID", learner, margin=margin)
+    learner.learning = False
+    learner.epsilon = 0.0
+    return learner
+
+
+def train_all_variants():
+    return {key: (train_hybrid_learner(n, margin), margin)
+            for key, (n, margin) in Q_VARIANTS.items()}
+
+
+def evaluate_configs(learners, opponent):
+    rows = []
+    for name, arch, variant in CONFIGS:
+        learner, margin = learners[variant] if variant else (None, None)
+        for seed in TP6_EVAL_SEEDS:
+            m = tp6_episode(seed, arch, learner, opponent, margin=margin)
+            rows.append({"config": name, "opponent": opponent, "seed": seed}
+                        | m.metrics(RM))
+    from agents import PlayerAgent
+    PlayerAgent.Q_MARGIN = Q_VARIANTS["q"][1]
+    return rows
+
+
+def stat(rows, key):
+    values = [r[key] for r in rows if r[key] == r[key]]   # ignore NaN
+    if not values:
+        return float("nan"), float("nan")
+    return statistics.mean(values), (statistics.stdev(values) if len(values) > 1 else 0.0)
+
+
+def wdl(rows):
+    w = sum(r["goals_for"] > r["goals_against"] for r in rows)
+    d = sum(r["goals_for"] == r["goals_against"] for r in rows)
+    return w, d, len(rows) - w - d
+
+
+def print_macro(rows):
+    print(f"   {'configuration':<15}{'BP':>10}{'BC':>10}{'V-N-D':>9}{'tirs':>6}"
+          f"{'passes':>8}{'progr.':>8}{'pertes':>8}{'recup.':>8}{'poss.':>7}"
+          f"{'disp.':>7}")
+    for name, _, _ in CONFIGS:
+        rs = [r for r in rows if r["config"] == name]
+        gf, gf_sd = stat(rs, "goals_for")
+        ga, ga_sd = stat(rs, "goals_against")
+        w, d, l = wdl(rs)
+        print(f"   {name:<15}{gf:>5.2f}±{gf_sd:<4.2f}{ga:>5.2f}±{ga_sd:<4.2f}"
+              f"{f'{w}-{d}-{l}':>9}{stat(rs, 'shots')[0]:>6.1f}"
+              f"{stat(rs, 'pass_success')[0]:>8.0%}{stat(rs, 'ball_progression')[0]:>8.1f}"
+              f"{stat(rs, 'ball_losses')[0]:>8.1f}{stat(rs, 'recovery_time')[0]:>8.1f}"
+              f"{stat(rs, 'possession')[0]:>7.0%}{stat(rs, 'dispersion')[0]:>7.1f}")
+
+
+def print_micro(rows):
+    print(f"   {'configuration':<15}{'revisions':>10}{'chgt int.':>10}"
+          f"{'abandons':>9}{'replans':>8}{'messages':>9}{'reactif':>8}{'Q':>6}")
+    for name, _, _ in CONFIGS:
+        rs = [r for r in rows if r["config"] == name]
+        print(f"   {name:<15}{stat(rs, 'belief_revisions')[0]:>10.0f}"
+              f"{stat(rs, 'intention_changes')[0]:>10.1f}"
+              f"{stat(rs, 'dropped_rate')[0]:>9.0%}{stat(rs, 'replans')[0]:>8.1f}"
+              f"{stat(rs, 'messages')[0]:>9.1f}{stat(rs, 'reactive_share')[0]:>8.0%}"
+              f"{stat(rs, 'q_share')[0]:>6.0%}")
+
+
+def export_rows(filename, rows):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, filename)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def tp6_comparison():
+    title("TP6 / 6.2 - Experiences comparatives (REAL_MADRID, 30 episodes par\n"
+          "configuration, memes graines 2000-2029, contre BARCELONA a regles fixes).\n"
+          "HYBRIDE+Q : entraine sur 120 episodes separes (graines 0-119), le Q-learning\n"
+          "ne contredit le BDI/plan que si Q(alternative) > Q(proposee) + 2.\n"
+          "HYBRIDE+Q naif : 40 episodes, marge 0. Evaluation sans apprentissage.")
+    learners = train_all_variants()
+    rows = evaluate_configs(learners, "REACTIVE")
+    print("\nIndicateurs MACRO (moyenne par match, ± ecart-type entre episodes) :")
+    print("   BP/BC = buts pour/contre, passes = taux de reussite, progr. = metres\n"
+          "   gagnes par possession, recup. = ticks pour recuperer le ballon,\n"
+          "   poss. = possession, disp. = distance moyenne au centre de l'equipe")
+    print_macro(rows)
+    print("\nIndicateurs MICRO (moyenne par match) :")
+    print("   revisions = croyances revisees, chgt int. = changements d'intention,\n"
+          "   abandons = part des intentions abandonnees car impossibles,\n"
+          "   reactif / Q = part des decisions prises par la couche reactive / le Q-learning")
+    print_micro(rows)
+    path = export_rows("tp6_comparison.csv", rows)
+    print(f"\n   CSV : {path}")
+    return learners, rows
+
+
+def tp6_robustness(learners, base_rows):
+    title("TP6 / Question 13 - Robustesse : on change le scenario.\n"
+          "L'adversaire n'est plus a regles fixes mais HYBRIDE (BDI + plan +\n"
+          "communication). HYBRIDE+Q garde la politique apprise contre les regles.")
+    rows = evaluate_configs(learners, "HYBRID")
+    print_macro(rows)
+    print("\n   Difference de buts moyenne par match (BP - BC) :")
+    print(f"   {'configuration':<15}{'vs regles':>11}{'vs hybride':>12}{'ecart':>8}")
+    for name, _, _ in CONFIGS:
+        a = [r["goals_for"] - r["goals_against"] for r in base_rows if r["config"] == name]
+        b = [r["goals_for"] - r["goals_against"] for r in rows if r["config"] == name]
+        da, db = statistics.mean(a), statistics.mean(b)
+        print(f"   {name:<15}{da:>+11.2f}{db:>+12.2f}{db - da:>+8.2f}")
+    export_rows("tp6_robustness.csv", rows)
+
+
+def decide(agent):
+    """Un cycle de decision complet SANS execution (scenario controle)."""
+    agent.bdi_events = []
+    agent.last_decision_reason = None
+    agent.revise_beliefs_from(agent.perceive())
+    agent.process_messages()
+    agent.derive_teammate_beliefs()
+    urgent = agent.reactive_layer()
+    module = agent.last_module
+    decision = agent.deliberative_layer()
+    if urgent is not None:
+        agent.last_decision_reason = (f"{agent.reactive_reason} ; la decision "
+                                      f"deliberative {decision[0]} est inhibee")
+        agent.last_module = module
+        decision = urgent
+    agent.last_action = decision
+    agent.pending_transition = None
+    return decision
+
+
+def tp6_scenario_a(learner):
+    title("TP6 / Scenario A - Pression sur le porteur\n"
+          "Un defenseur a moins de 2 m du porteur RM3 : on verifie pressure=HIGH,\n"
+          "on observe le desir KEEP_POSSESSION et on compare regle, intention et\n"
+          "action apprise.")
+    variants = [
+        ("coequipier RM2 libre (BA3 a 1.8 m)", (61.8, 34.0), (70.0, 20.0)),
+        ("aucun coequipier visible (BA3 a 1.2 m)", (61.2, 34.0), (20.0, 5.0)),
+    ]
+    for label, defender, mate in variants:
+        print(f"\n--- {label}")
+        for name, arch, uses_q in (("REACTIF (regles)", "REACTIVE", False),
+                                   ("BDI (intention)", "BDI", False),
+                                   ("HYBRIDE+Q (appris)", "HYBRID", True)):
+            model = FootballModel(seed=0, verbose=False,
+                                  team_architectures={RM: arch, BA: "REACTIVE"},
+                                  learners={RM: learner} if uses_q else {})
+            for player, pos in {f"{RM}3": (60.0, 34.0), f"{BA}3": defender,
+                                f"{RM}2": mate, f"{RM}1": (20.0, 34.0),
+                                f"{BA}1": (88.0, 34.0), f"{BA}2": (90.0, 60.0)}.items():
+                model.space.move_agent(model.get_player(player), pos)
+            rm3 = model.get_player(f"{RM}3")
+            model.give_ball(rm3)
+            decide(rm3)
+            e = rm3.explain_decision()
+            desires = ", ".join(f"{g}({u:.0f})" for g, u in rm3.desires) or "-"
+            print(f"   {name:<20} pressure={e['beliefs']['pressure']:<5} "
+                  f"desirs=[{desires}]")
+            print(f"   {'':<20} -> {e['chosen_action']:<13} module={e['module']}")
+            print(f"   {'':<20}    raison : {e['reason']}")
+
+
+def tp6_traces(learner):
+    title("TP6 / Livrable 5 - Traces d'execution (un match HYBRIDE+Q qui apprend)\n"
+          "+ export du DataCollector de Mesa et du journal d'explicabilite")
+    learner.learning = True
+    learner.epsilon = 0.1
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        m = FootballModel(seed=7, verbose=True, collect_data=True,
+                          team_architectures={RM: "HYBRID", BA: "REACTIVE"},
+                          learners={RM: learner})
+        m.trace = {p.name for p in m.players(RM)}
+        explanations = []
+        for _ in range(EPISODE_TICKS):
+            m.step()
+            for p in m.players(RM):
+                if p.has_ball and len(explanations) < 3 and p.last_action[0] in (
+                        "PASS", "DRIBBLE", "SHOOT") and "Q-LEARNING" in p.last_module:
+                    explanations.append(p.explain_text())
+    log = buffer.getvalue().splitlines()
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(os.path.join(RESULTS_DIR, "tp6_traces.txt"), "w", encoding="utf-8") as f:
+        f.write("\n".join(log))
+
+    wanted = [("une revision de croyance (par message)", ("croyance revisee", "source agent:")),
+              ("une revision de croyance (par perception)", ("croyance revisee", "source perception")),
+              ("un changement d'intention", ("nouvelle intention : ",)),
+              ("un replan", ("plan invalide",)),
+              ("une mise a jour Q", ("Q-update",))]
+    for label, needles in wanted:
+        line = next((x for x in log if all(n in x for n in needles)
+                     and "None ->" not in x), None)
+        missing = ("(pas dans ce match ; voir le protocole 4.3 : "
+                   "python experiments.py tp4)")
+        print(f"\n{label} :\n   {line.strip() if line else missing}")
+
+    print("\nJournal d'explicabilite (annexe B) :")
+    for text in explanations:
+        print(f"   - {text}")
+
+    model_df = m.datacollector.get_model_vars_dataframe()
+    agent_df = m.datacollector.get_agent_vars_dataframe()
+    model_df.to_csv(os.path.join(RESULTS_DIR, "tp6_datacollector_model.csv"))
+    agent_df.to_csv(os.path.join(RESULTS_DIR, "tp6_datacollector_agents.csv"))
+    print(f"\n   DataCollector : {len(model_df)} lignes modele, {len(agent_df)} "
+          f"lignes agents ; traces completes dans results/tp6_traces.txt")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("all", "tp1"):
@@ -706,3 +960,8 @@ if __name__ == "__main__":
     if which in ("all", "tp5"):
         tp5_tests(tp5_exploration())
         tp5_scenario_d()
+    if which in ("all", "tp6"):
+        tp6_learners, tp6_rows = tp6_comparison()
+        tp6_robustness(tp6_learners, tp6_rows)
+        tp6_scenario_a(tp6_learners["q"][0])
+        tp6_traces(tp6_learners["q"][0])

@@ -153,7 +153,9 @@ class PlayerAgent(mesa.Agent):
         self.pending_transition = None     # (s, a) en attente de son renforcement
         self.last_reward = 0.0
 
-        # --- Explicabilite ---
+        # --- Explicabilite (annexe B) ---
+        self.last_decision_reason = None
+        self.reactive_reason = None
         self.last_module = None
         self.last_rule = None
         self.applicable_rules = []
@@ -198,6 +200,7 @@ class PlayerAgent(mesa.Agent):
     # =================================================================
     def step(self):
         self.bdi_events = []
+        self.last_decision_reason = None
 
         percept = self.perceive()
         self.revise_beliefs_from(percept)
@@ -221,6 +224,8 @@ class PlayerAgent(mesa.Agent):
         if urgent is not None:
             self.inhibited_decision = decision
             self.last_module = reactive_module
+            self.last_decision_reason = (f"{self.reactive_reason} ; la decision "
+                                         f"deliberative {decision[0]} est inhibee")
             self.applicable_rules = []
             self.pending_transition = None   # l'action apprise n'a pas ete jouee
             self.execute(urgent)
@@ -232,6 +237,7 @@ class PlayerAgent(mesa.Agent):
                 self.pending_transition["result"] = result
 
         self.communicate()
+        self.model.module_counts[self.team][self.last_module.split(":")[0]] += 1
         self.log_tick()
 
     # =================================================================
@@ -369,18 +375,24 @@ class PlayerAgent(mesa.Agent):
     def reactive_layer(self):
         if self.danger_near_own_goal():
             self.last_module = "REACTIVE:N4_urgence_defensive"
+            self.reactive_reason = ("reflexe N4 : porteur adverse pres de notre "
+                                    "but et je suis le plus proche")
             return ("INTERCEPT", None)
 
         if self.has_ball and self.is_under_strong_pressure():
             self.last_module = "REACTIVE:N3_protection_ballon"
+            self.reactive_reason = ("reflexe N3 : adversaire au contact et "
+                                    "aucune passe possible")
             return ("PROTECT_BALL", None)
 
         if not self.has_ball and self.belief("mate_too_close") is not None:
             self.last_module = "REACTIVE:N2_collision"
+            self.reactive_reason = "reflexe N2 : coequipier trop proche"
             return ("AVOID_COLLISION", self.belief("mate_too_close"))
 
         if self.belief("near_sideline"):
             self.last_module = "REACTIVE:N2_sortie_terrain"
+            self.reactive_reason = "reflexe N2 : sur la ligne de touche"
             return ("STAY_IN_BOUNDS", None)
 
         return None
@@ -435,7 +447,16 @@ class PlayerAgent(mesa.Agent):
         # Selection de l'action qui sert l'intention
         self.applicable_rules = []
         self.last_module = f"BDI:{self.intention}"
-        return self.next_action_for_intention()
+        action = self.next_action_for_intention()
+        self.last_decision_reason = self.last_decision_reason or (
+            f"l'intention {self.intention} se realise par {action[0]}")
+
+        # TP 6 (niveau 5 de l'arbitrage) : l'apprentissage ajuste la
+        # preference entre l'action proposee et ses concurrentes.
+        if (self.architecture == "HYBRID" and self.learner is not None
+                and self.belief("has_ball")):
+            action = self.select_with_policy(action)
+        return action
 
     # --- 2.4 Desirs -------------------------------------------------------
     def generate_desires(self):
@@ -797,6 +818,10 @@ class PlayerAgent(mesa.Agent):
             self.model.team_plans.pop(self.team, None)
 
     def concrete_step(self, step):
+        plan = self.model.team_plans.get(self.team)
+        self.last_decision_reason = (
+            f"etape {plan.index + 1}/{len(plan.steps)} du plan : {step.describe()}"
+            if plan is not None else f"etape du plan : {step.describe()}")
         if step.kind == "DRIBBLE":
             return ("DRIBBLE", None)
         if step.kind == "RUN":
@@ -1131,6 +1156,8 @@ class PlayerAgent(mesa.Agent):
         _, rule_name, action = max(applicable, key=lambda r: r[0])
         self.last_rule = rule_name
         self.last_module = f"RULES:{rule_name}"
+        self.last_decision_reason = (f"regle {rule_name}, la plus prioritaire "
+                                     f"parmi {self.applicable_rules}")
         return action(self)
 
     # =================================================================
@@ -1150,6 +1177,7 @@ class PlayerAgent(mesa.Agent):
     def automaton_decision(self):
         self.applicable_rules = []
         self.last_module = f"AUTOMATON:{self.state}"
+        self.last_decision_reason = f"automate : etat {self.state}"
         if self.state == "CHASE":
             return ("MOVE_TO_BALL", None)
         if self.state == "SUPPORT":
@@ -1298,30 +1326,104 @@ class PlayerAgent(mesa.Agent):
             actions.insert(0, "PASS")
         return actions
 
-    def rl_decision(self):
-        state = self.rl_state()
-        action, explored = self.learner.choose(state, self.rl_available())
-        self.applicable_rules = []
-        self.last_module = (f"Q-LEARNING:{'exploration' if explored else 'exploitation'}"
-                            f" Q={self.learner.value(state, action):+.2f}")
+    def learning_state(self):
+        """Etat du Q-learning : celui du sujet (5.2) ; dans l'architecture
+        hybride on y ajoute l'intention courante, pour apprendre une
+        preference par intention."""
+        if self.architecture == "HYBRID":
+            return self.rl_state() + (self.intention,)
+        return self.rl_state()
+
+    def pass_receiver(self):
         mate = self.belief("best_mate")
         if self.learner.pass_target == "nearest" and mate is not None:
             free = [m for m in self.visible_mates
                     if m.name in self.belief("free_mates")]
             mate = min(free, key=lambda m: self.distance_to(m.pos), default=mate)
+        return mate
+
+    def start_transition(self, state, action, receiver):
+        """Memorise (s, a) : la recompense sera calculee au tick suivant."""
         ball_dist = self.goal_dist_of(self.belief("ball_position"))
         self.pending_transition = {
             "state": state, "action": action,
             "score": self.model.score[self.team],
             "ball_zone": zone_label(ball_dist),
-            "pass_gain": (self.forward(mate.pos[0]) - self.forward(self.pos[0])
-                          if mate is not None else 0.0),
+            "pass_gain": (self.forward(receiver.pos[0]) - self.forward(self.pos[0])
+                          if receiver is not None else 0.0),
             "shot_dist": self.belief("goal_dist"),
             "result": None,
         }
+
+    def rl_decision(self):
+        state = self.learning_state()
+        action, explored = self.learner.choose(state, self.rl_available())
+        self.applicable_rules = []
+        self.last_module = (f"Q-LEARNING:{'exploration' if explored else 'exploitation'}"
+                            f" Q={self.learner.value(state, action):+.2f}")
+        self.last_decision_reason = (
+            f"Q-learning ({'exploration' if explored else 'exploitation'}) : "
+            f"{action} vaut {self.learner.value(state, action):+.2f} dans {state}")
+        receiver = self.pass_receiver()
+        self.start_transition(state, action, receiver)
         if action == "PASS":
-            return ("PASS", mate)
+            return ("PASS", receiver)
         return (action, None)
+
+    # --- TP 6 : le Q-learning arbitre entre actions concurrentes ----------
+    # Actions compatibles avec chaque intention : le BDI garde le "quoi",
+    # l'apprentissage choisit le "comment" parmi ces options.
+    # Ecart de Q exige pour contredire l'action proposee par l'intention / le
+    # plan. Avec 0 (arbitrage "naif"), le Q-learning cassait les plans sur des
+    # estimations encore bruitees et l'equipe perdait 17 matchs sur 30 (TP 6).
+    Q_MARGIN = 2.0
+
+    INTENTION_OPTIONS = {
+        "SCORE": {"SHOOT", "DRIBBLE"},
+        "KEEP_POSSESSION": {"PASS", "DRIBBLE"},
+        "PROGRESS": {"PASS", "DRIBBLE"},
+        "CREATE_SHOT": {"PASS", "DRIBBLE", "SHOOT"},
+        "FOLLOW_PLAN": {"PASS", "DRIBBLE", "SHOOT"},
+    }
+
+    def available_actions_from_plan(self, proposed):
+        """Candidats : l'action proposee par l'intention / le plan, plus les
+        actions de U(x) compatibles avec l'intention."""
+        if proposed[0] not in ("PASS", "DRIBBLE", "SHOOT"):
+            return [proposed[0]]          # protection, attente... : pas d'arbitrage
+        allowed = self.INTENTION_OPTIONS.get(self.intention, set())
+        candidates = [a for a in self.rl_available() if a in allowed]
+        if proposed[0] not in candidates:
+            candidates.append(proposed[0])
+        return candidates
+
+    def select_with_policy(self, proposed):
+        candidates = self.available_actions_from_plan(proposed)
+        if len(candidates) <= 1:
+            return proposed
+        state = self.learning_state()
+        action, explored = self.learner.choose(state, candidates)
+        # En exploitation, on ne contredit l'intention / le plan que si
+        # l'alternative vaut nettement mieux (marge Q_MARGIN).
+        if (not explored and action != proposed[0]
+                and self.learner.value(state, action)
+                < self.learner.value(state, proposed[0]) + self.Q_MARGIN):
+            action = proposed[0]
+        mode = "exploration" if explored else "exploitation"
+        q_text = " ".join(f"{a}={self.learner.value(state, a):+.1f}" for a in candidates)
+        self.last_module = (f"Q-LEARNING:{mode}|BDI:{self.intention} "
+                            f"propose {proposed[0]} [{q_text}]")
+        self.last_decision_reason = (
+            f"l'intention {self.intention} proposait {proposed[0]} ; le Q-learning "
+            f"({mode}) choisit {action} parmi {candidates} ({q_text})")
+        if action == proposed[0]:
+            receiver = proposed[1] if action == "PASS" else self.pass_receiver()
+            self.start_transition(state, action, receiver)
+            return proposed               # on garde le receveur prevu par le plan
+        self.pending_plan_step = None     # l'etape du plan n'est pas jouee
+        receiver = self.pass_receiver()
+        self.start_transition(state, action, receiver)
+        return ("PASS", receiver) if action == "PASS" else (action, None)
 
     def learn_from_pending(self):
         """5.6 : boucle perception -> action -> renforcement. La decision du
@@ -1349,7 +1451,7 @@ class PlayerAgent(mesa.Agent):
             "ball_lost": not team_has_ball and not goal,
         }
         reward, reasons = compute_reward(self.learner.rewards, event)
-        next_state = self.rl_state()
+        next_state = self.learning_state()
         change = self.learn((p["state"], p["action"], reward, next_state,
                              self.rl_available()))
         if event["ball_lost"]:
@@ -1360,6 +1462,57 @@ class PlayerAgent(mesa.Agent):
             self.bdi_events.append(
                 f"Q-update : Q({p['state']}, {p['action']}) {old:+.2f} -> {new:+.2f}"
                 f"  r={reward:+.0f} [{', '.join(reasons)}]")
+
+    # =================================================================
+    # ANNEXE B  JOURNAL D'EXPLICABILITE
+    # =================================================================
+    def compact_beliefs(self):
+        b = self.belief
+        return {"ball_owner": self._name(b("ball_owner")),
+                "pressure": b("pressure"),
+                "best_mate": self._name(b("best_mate")),
+                "goal_dist": round(b("goal_dist") or 0.0, 1),
+                "has_ball": b("has_ball")}
+
+    def explain_decision(self):
+        """Trace structuree de la derniere decision (listing 22)."""
+        plan = self.model.team_plans.get(self.team)
+        action = self.last_action[0] if self.last_action else None
+        q_value = None
+        if self.learner is not None and action in ("PASS", "DRIBBLE", "SHOOT"):
+            q_value = round(self.learner.value(self.learning_state(), action), 2)
+        return {
+            "tick": self.model.steps,
+            "agent": self.name,
+            "beliefs": self.compact_beliefs(),
+            "desires": [g for g, _ in self.desires],
+            "intention": self.intention,
+            "plan": ([s.name for s in plan.steps[plan.index:]]
+                     if plan is not None and self.intention in
+                     ("CREATE_SHOT", "FOLLOW_PLAN") else []),
+            "module": self.last_module,
+            "chosen_action": action,
+            "q_value": q_value,
+            "reason": self.last_decision_reason,
+        }
+
+    def explain_text(self):
+        """Lecture en langage naturel de explain_decision()."""
+        e = self.explain_decision()
+        b = e["beliefs"]
+        parts = [f"Le joueur {self.name} croit que la pression est {b['pressure']}"]
+        parts[0] += (f" et que {b['best_mate']} est libre." if b["best_mate"]
+                     else " et qu'aucun coequipier n'est libre.")
+        if e["desires"]:
+            parts.append(f"Son desir prioritaire est {e['desires'][0]}.")
+        if e["intention"]:
+            parts.append(f"Il poursuit l'intention {e['intention']}.")
+        if e["plan"]:
+            parts.append(f"Plan restant : {' -> '.join(e['plan'])}.")
+        if e["reason"]:
+            parts.append(f"Raison : {e['reason']}.")
+        parts.append(f"Il choisit {e['chosen_action']}.")
+        return " ".join(parts)
 
     # =================================================================
     # JOURNAL
