@@ -9,7 +9,9 @@ Politique de revision (inspiree des TMS, sans TMS complet) :
   2. une nouvelle information est acceptee si sa confiance effective
      est STRICTEMENT superieure a celle de la croyance en place ;
   3. a confiance effective egale, la plus recente l'emporte ;
-  4. sinon elle est rejetee : on garde la croyance existante
+  4. une information plus recente provenant de la MEME source remplace
+     toujours l'ancienne (c'est une mise a jour du meme canal) ;
+  5. sinon elle est rejetee : on garde la croyance existante
      (conserver ce qui est compatible, changer le minimum necessaire).
 """
 
@@ -95,6 +97,8 @@ class BeliefBase:
         elif abs(new_conf - old_conf) <= EPS and tick >= old.tick:
             reason = (f"confiance egale ({new_conf:.2f}), "
                       f"plus recente (tick {tick} >= {old.tick})")
+        elif source == old.source and tick >= old.tick:
+            reason = f"mise a jour de la meme source ({source})"
         else:
             reason = (f"moins fiable ({new_conf:.2f} < {old_conf:.2f})"
                       if new_conf < old_conf - EPS
@@ -104,7 +108,8 @@ class BeliefBase:
             return revision
 
         self._beliefs[key] = new
-        routine = key in ROUTINE and old.source == new.source
+        routine = ((key in ROUTINE or key.startswith("mate_free:"))
+                   and old.source == new.source == "perception")
         if old.value == new.value or routine:
             return Revision(key, "updated", old, new, reason)
 

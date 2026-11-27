@@ -10,7 +10,7 @@
 """
 
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 # =============================================================================
 # 3.1  Propositions symboliques
@@ -185,6 +185,12 @@ class TeamPlan:
     created_tick: int
     step_started: int = 0         # tick de debut de l'etape courante
     index: int = 0
+    # TP 4 : statut des taches demandees par message {indice: (statut, tick)}
+    status: dict = field(default_factory=dict)
+
+    @property
+    def plan_id(self):
+        return f"{self.author}@{self.created_tick}"
 
     def current(self):
         return self.steps[self.index] if self.index < len(self.steps) else None

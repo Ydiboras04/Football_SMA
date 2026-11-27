@@ -6,8 +6,12 @@ TP 1 : architecture horizontale + couche reactive (subsomption)
 TP 2 : agent BDI. Les croyances ont une source et une confiance et sont
        revisees ; la couche deliberative genere des desirs, choisit une
        intention, s'y engage et choisit l'action qui la sert.
+TP 3 : planification (plan d'equipe vers SHOT_CREATED, replanification).
+TP 4 : communication par actes de langage (INFORM, REQUEST, PROPOSE,
+       CONFIRM, REFUSE) : les taches du plan sont demandees et acceptees.
 
     perception -> revision des croyances (B)
+               -> messages recus (revision, requetes, confirmations)
                -> couche reactive (subsomption) ---- urgence ----+
                -> couche deliberative                            |
                     architecture "REACTIVE" : regles (porteur)   |
@@ -16,6 +20,7 @@ TP 2 : agent BDI. Les croyances ont une source et une confiance et sont
                                               -> intention (I)   |
                                               -> action          |
                -> execution  <---------------------------------- +
+               -> communication (messages envoyes)
 """
 
 import math
@@ -23,6 +28,8 @@ import math
 import mesa
 
 from beliefs import ENVIRONMENT, PERSONAL, RELATIONAL, SOCIAL, BeliefBase
+from messages import (CONFIRM, INFORM, PROPOSE, RECEIVE, REFUSE, REQUEST,
+                      RUN_INTO_SPACE, TASK_CANCELLED, Message)
 from planning import (GOAL, HAS_BALL, MATE_FREE, NO_PRESSURE, ZONE_ORDER,
                       PlannedAction, TeamPlan, bfs_plan, resolve_conflicts,
                       short, states_along, zone_of)
@@ -55,6 +62,24 @@ RUN_WIDTH = 10.0          # ... decalee de 10 m sur le cote
 RUN_DONE_DIST = 3.0       # course terminee a moins de 3 m de la cible
 PLAN_SLACK = 15           # retard tolere sur une etape avant de replanifier
 ZONE_CELL = (15.0, 17.0)  # taille d'une "zone de reception" (ressource)
+
+# --- Communication (TP 4) ----------------------------------------------------
+SELF_REPORT_CONFIDENCE = 0.95  # un joueur sait mieux que quiconque s'il est marque
+CONFIRM_CONFIDENCE = 0.9       # "je suis libre" implicite dans un CONFIRM
+PROPOSE_CONFIDENCE = 0.8
+REPLY_TIMEOUT = 4              # ticks d'attente d'une reponse a un REQUEST
+REFUSAL_MEMORY = 6             # on ne redemande pas a qui a refuse depuis 6 ticks
+TASK_TIMEOUT = 40              # une tache acceptee expire apres 40 ticks
+PROPOSE_INTERVAL = 10          # au plus une proposition tous les 10 ticks
+MAX_RUN_DIST = 30.0            # course refusee si la cible est trop loin
+
+
+def perceived_free_confidence(distance):
+    """Confiance dans "ce coequipier est libre" vue de loin : 1.0 jusqu'a 10 m,
+    puis decroissante jusqu'a 0.5 au bord du champ de perception."""
+    if distance <= 10.0:
+        return 1.0
+    return max(0.5, 1.0 - (distance - 10.0) / 30.0)
 
 
 # =============================================================================
@@ -98,6 +123,7 @@ class PlayerAgent(mesa.Agent):
         self.beliefs = BeliefBase()
         self.perception_confidence = 1.0   # baisse si la vision est genee
         self.tick_revisions = []           # revisions / rejets du tick courant
+        self.visible_mates = []
 
         # --- D, I : desirs et intention (TP 2) ---
         self.desires = []                  # [(but, utilite)], tries
@@ -111,6 +137,16 @@ class PlayerAgent(mesa.Agent):
         # --- Planification (TP 3) ---
         self.pending_plan_step = None      # etape de plan en cours d'execution
         self.replans = 0
+
+        # --- Communication (TP 4) ---
+        self.inbox = []                    # messages recus, traites au tick suivant
+        self.task = None                   # tache acceptee (engagement envers un coequipier)
+        self.refusals = {}                 # {joueur: tick du refus}
+        self.proposals = {}                # {joueur: tick de la proposition}
+        self.last_reported_free = None     # dernier statut "libre" annonce
+        self.last_proposal_tick = -PROPOSE_INTERVAL
+        self.messages_sent = 0
+        self.messages_received = 0
 
         # --- Explicabilite ---
         self.last_module = None
@@ -144,6 +180,10 @@ class PlayerAgent(mesa.Agent):
         percept = self.perceive()
         self.revise_beliefs_from(percept)
 
+        # TP 4 : informations sociales (messages recus au tick precedent)
+        self.process_messages()
+        self.derive_teammate_beliefs()
+
         # La couche reactive est consultee en premier...
         urgent = self.reactive_layer()
         reactive_module = self.last_module
@@ -163,6 +203,7 @@ class PlayerAgent(mesa.Agent):
             result = self.execute(decision)
             self.finish_plan_step(self.pending_plan_step, result)
 
+        self.communicate()
         self.log_tick()
 
     # =================================================================
@@ -212,9 +253,6 @@ class PlayerAgent(mesa.Agent):
             ("pressure", "HIGH" if nearest_opp_dist < PRESSURE_HIGH
              else "MEDIUM" if nearest_opp_dist < PRESSURE_MEDIUM else "LOW",
              RELATIONAL),
-            ("best_mate", self.find_best_teammate(mates, opponents), RELATIONAL),
-            ("free_mates", frozenset(m.name for m in self.free_teammates(
-                mates, opponents)), RELATIONAL),
             ("mate_too_close", closest_mate, RELATIONAL),
             ("closest_mate_to_ball",
              all(m.distance_to(ball_pos) >= dist_ball for m in mates), RELATIONAL),
@@ -237,6 +275,20 @@ class PlayerAgent(mesa.Agent):
             if revision.status in ("revised", "rejected"):
                 self.tick_revisions.append(revision)
 
+        # Une croyance par coequipier visible : "est-il libre ?" La confiance
+        # baisse avec la distance (on voit mal le marquage d'un joueur lointain),
+        # ce qui laisse une chance a ce qu'il nous dit lui-meme (TP 4).
+        self.visible_mates = mates
+        free_names = {m.name for m in self.free_teammates(mates, opponents)}
+        for m in mates:
+            confidence = (perceived_free_confidence(self.distance_to(m.pos))
+                          * self.perception_confidence)
+            revision = self.beliefs.revise(
+                f"mate_free:{m.name}", m.name in free_names, "perception",
+                tick=now, now=now, confidence=confidence, category=RELATIONAL)
+            if revision.status in ("revised", "rejected"):
+                self.tick_revisions.append(revision)
+
         # --- sociales / organisationnelles : connues par construction ---
         for key, value in (("role", self.role), ("team", self.team),
                            ("home_zone", self.home)):
@@ -254,6 +306,20 @@ class PlayerAgent(mesa.Agent):
         if revision.status in ("revised", "rejected"):
             self.tick_revisions.append(revision)
         return revision
+
+    def derive_teammate_beliefs(self):
+        """Croyances deduites des croyances "mate_free:X" (perception ou
+        messages) : coequipiers libres visibles et meilleur receveur."""
+        free = [m for m in self.visible_mates
+                if self.belief(f"mate_free:{m.name}", False)]
+        best = max(free, key=lambda m: self.forward(m.pos[0]), default=None)
+        now = self.model.steps
+        for key, value in (("free_mates", frozenset(m.name for m in free)),
+                           ("best_mate", best)):
+            revision = self.beliefs.revise(key, value, "deduction", tick=now,
+                                           now=now, category=RELATIONAL)
+            if revision.status in ("revised", "rejected"):
+                self.tick_revisions.append(revision)
 
     @staticmethod
     def free_teammates(mates, opponents):
@@ -480,6 +546,8 @@ class PlayerAgent(mesa.Agent):
         if i == "CREATE_SHOT":
             return self.model.team_shots[self.team] > self.intention_context["shots"]
         if i == "FOLLOW_PLAN":
+            if self.model.communication and not b("has_ball"):
+                return False   # la tache acceptee dure jusqu'a la passe (ou annulation)
             plan = self.model.team_plans.get(self.team)
             return plan is not None and not plan.pending_for(self.name)
         return False
@@ -497,6 +565,8 @@ class PlayerAgent(mesa.Agent):
             return (owner is not None and owner.team == self.team
                     and self.assigned_plan_step() is not None)
         return True
+
+    # (avec communication, assigned_plan_step() renvoie la tache acceptee)
 
     def drop_achieved_intentions(self):
         if self.intention is not None and self.intention_achieved():
@@ -554,7 +624,11 @@ class PlayerAgent(mesa.Agent):
     # TP 3  PLANIFICATION
     # =================================================================
     def assigned_plan_step(self):
-        """Prochaine etape du plan d'equipe confiee a ce joueur, ou None."""
+        """Prochaine etape du plan d'equipe confiee a ce joueur, ou None.
+        Avec communication (TP 4), un joueur sans ballon ne lit pas le plan
+        du porteur : sa seule tache est celle qu'il a acceptee par message."""
+        if self.model.communication and not self.belief("has_ball"):
+            return self.task
         plan = self.model.team_plans.get(self.team)
         if plan is None:
             return None
@@ -590,6 +664,8 @@ class PlayerAgent(mesa.Agent):
 
     # --- Execution du plan (boucle fermee ou ouverte) ---------------------
     def plan_action(self):
+        if self.model.communication and not self.belief("has_ball"):
+            return self.task_action()
         plan = self.model.team_plans.get(self.team)
         if self.belief("has_ball"):
             plan = self.maintain_plan(plan)
@@ -621,12 +697,17 @@ class PlayerAgent(mesa.Agent):
 
         problem = self.plan_problem(plan, state)
         if problem is None:
+            self.request_current_task(plan)
             return plan
         if plan is not None:
             self.replans += 1
             self.model.total_replans += 1
             self.bdi_events.append(f"plan invalide : {problem} -> replanification")
-        return self.make_plan(state)
+            self.cancel_requested_tasks(plan)
+        plan = self.make_plan(state)
+        if plan is not None:
+            self.request_current_task(plan)
+        return plan
 
     def plan_problem(self, plan, state):
         if plan is None:
@@ -636,6 +717,14 @@ class PlayerAgent(mesa.Agent):
             return "plan termine"
         if step.kind in ("DRIBBLE", "PASS", "SHOOT") and step.actor_id != self.name:
             return f"le porteur devait etre {step.actor_id}"
+        if self.model.communication and step.kind == "RUN":
+            status, since = plan.status.get(plan.index, (None, None))
+            if status == REFUSE:
+                return f"{step.actor_id} a refuse la course"
+            if status == REQUEST and self.model.steps - since > REPLY_TIMEOUT:
+                return f"{step.actor_id} n'a pas repondu"
+            if status == CONFIRM and self.reported_marked(step.actor_id):
+                return f"{step.actor_id} signale qu'il est marque"
         if self.model.plan_mode == "open":
             return None   # boucle ouverte : on execute la sequence prevue
         missing = step.schema.preconditions - state
@@ -662,6 +751,9 @@ class PlayerAgent(mesa.Agent):
                 runner = self.model.get_player(step.actor_id)
                 done = (runner.distance_to(step.target_pos) < RUN_DONE_DIST
                         or (state is not None and self.free_mate_ahead(runner)))
+                if self.model.communication:
+                    # 4.3 : pas de passe tant que la course n'est pas confirmee
+                    done = done and plan.status.get(plan.index, (None,))[0] == CONFIRM
             else:
                 done = False
             if not done:
@@ -728,7 +820,7 @@ class PlayerAgent(mesa.Agent):
         t = now
         carrier = self
         runner = None
-        busy = set()
+        busy = self.unavailable_mates()
         steps = []
         for sc in schemas:
             if sc.kind == "RUN":
@@ -781,8 +873,12 @@ class PlayerAgent(mesa.Agent):
             y = min(max(carrier.pos[1] + side, 3.0), self.model.space.y_max - 3.0)
             return (x, y)
 
-        runner = min(mates, key=lambda m: (m.role != "ATT",
-                                           m.distance_to(target_for(m))))
+        # TP 4 : un coequipier qui s'est propose recemment passe en premier.
+        now = self.model.steps
+        runner = min(mates, key=lambda m: (
+            now - self.proposals.get(m.name, -10**6) > PROPOSE_INTERVAL,
+            m.role != "ATT",
+            m.distance_to(target_for(m))))
         return runner, target_for(runner)
 
     def zone_id(self, pos):
@@ -799,6 +895,191 @@ class PlayerAgent(mesa.Agent):
             if zone not in taken:
                 return zone, pos
         return step.resource, step.target_pos
+
+    # =================================================================
+    # TP 4  COMMUNICATION ET COORDINATION
+    # =================================================================
+    def send(self, receiver, performative, content, **payload):
+        msg = Message(self.name, receiver, performative, content, payload,
+                      tick=self.model.steps)
+        self.model.bus.send(msg)
+        self.messages_sent += 1
+        self.bdi_events.append(f"-> envoye : {msg.describe()}")
+        return msg
+
+    # --- Cote porteur : demander, suivre, annuler -------------------------
+    def request_current_task(self, plan):
+        """4.3 etape 2 : la course n'est pas imposee, elle est DEMANDEE."""
+        if not self.model.communication or plan is None:
+            return
+        step = plan.current()
+        if step is None or step.kind != "RUN" or plan.index in plan.status:
+            return
+        plan.status[plan.index] = (REQUEST, self.model.steps)
+        self.send(step.actor_id, REQUEST, RUN_INTO_SPACE,
+                  target=step.target_pos, plan_id=plan.plan_id)
+
+    def cancel_requested_tasks(self, plan):
+        if not self.model.communication:
+            return
+        for index, (status, _) in plan.status.items():
+            if status in (REQUEST, CONFIRM):
+                self.send(plan.steps[index].actor_id, INFORM, TASK_CANCELLED,
+                          plan_id=plan.plan_id)
+
+    def unavailable_mates(self):
+        """Coequipiers a ne pas solliciter : refus recent ou marquage signale."""
+        if not self.model.communication:
+            return set()
+        now = self.model.steps
+        names = {n for n, t in self.refusals.items() if now - t <= REFUSAL_MEMORY}
+        names |= {m.name for m in self.model.players(self.team)
+                  if self.reported_marked(m.name)}
+        return names
+
+    def reported_marked(self, name):
+        """Le coequipier nous a-t-il dit lui-meme qu'il etait marque ?"""
+        belief = self.beliefs.get(f"mate_free:{name}")
+        return (belief is not None and belief.value is False
+                and belief.source.startswith("agent:"))
+
+    # --- Reception des messages (4.2) -------------------------------------
+    def process_messages(self):
+        inbox, self.inbox = self.inbox, []
+        for msg in inbox:
+            self.messages_received += 1
+            self.bdi_events.append(f"<- recu : {msg.describe()}")
+            handler = {INFORM: self.on_inform, REQUEST: self.on_request,
+                       PROPOSE: self.on_propose, CONFIRM: self.on_confirm,
+                       REFUSE: self.on_refuse}[msg.performative]
+            handler(msg)
+
+    def on_inform(self, msg):
+        if msg.content == TASK_CANCELLED:
+            if self.task and self.task["plan_id"] == msg.payload["plan_id"]:
+                self.bdi_events.append("tache annulee par le porteur")
+                self.task = None
+            return
+        # Partage d'une croyance : elle passe par la revision (source, confiance)
+        self.revise_one_belief(
+            msg.content, msg.payload.get("value"), source=f"agent:{msg.sender_id}",
+            confidence=msg.payload.get("confidence", 0.7), tick=msg.tick,
+            category=RELATIONAL)
+
+    def on_request(self, msg):
+        ok, reason = self.can_do(msg.content, msg.payload)
+        if not ok:
+            self.send(msg.sender_id, REFUSE, msg.content, reason=reason,
+                      plan_id=msg.payload["plan_id"])
+            return
+        self.task = {"plan_id": msg.payload["plan_id"], "kind": RUN_INTO_SPACE,
+                     "target": msg.payload["target"], "carrier": msg.sender_id,
+                     "since": self.model.steps}
+        self.last_reported_free = True
+        self.send(msg.sender_id, CONFIRM, msg.content,
+                  plan_id=msg.payload["plan_id"], value=True,
+                  confidence=CONFIRM_CONFIDENCE)
+        self.bdi_events.append(
+            f"engagement : course vers ({msg.payload['target'][0]:.0f},"
+            f"{msg.payload['target'][1]:.0f}) pour {msg.sender_id}")
+
+    def can_do(self, content, payload):
+        """4.3 etape 3 : le coequipier verifie SES croyances avant d'accepter."""
+        if content != RUN_INTO_SPACE:
+            return False, "requete inconnue"
+        owner = self.belief("ball_owner")
+        if owner is None or owner.team != self.team or self.belief("has_ball"):
+            return False, "situation de jeu changee"
+        if self.task is not None:
+            return False, "deja engage dans une autre tache"
+        if self.belief("nearest_opp_dist") < FREE_MARGIN:
+            return False, "je suis marque"
+        if self.distance_to(payload["target"]) > MAX_RUN_DIST:
+            return False, "zone trop loin"
+        return True, "ok"
+
+    def on_propose(self, msg):
+        self.proposals[msg.sender_id] = msg.tick
+        self.revise_one_belief(f"mate_free:{msg.sender_id}", True,
+                               source=f"agent:{msg.sender_id}",
+                               confidence=PROPOSE_CONFIDENCE, tick=msg.tick,
+                               category=RELATIONAL)
+
+    def on_confirm(self, msg):
+        plan = self.model.team_plans.get(self.team)
+        if plan is None or plan.plan_id != msg.payload["plan_id"]:
+            return
+        for index, step in enumerate(plan.steps):
+            if step.actor_id == msg.sender_id and plan.status.get(index, (None,))[0] == REQUEST:
+                plan.status[index] = (CONFIRM, self.model.steps)
+                self.bdi_events.append(
+                    f"engagement confirme par {msg.sender_id} : {step.describe()}")
+        # "je suis libre" est implicite dans l'acceptation
+        self.revise_one_belief(f"mate_free:{msg.sender_id}", True,
+                               source=f"agent:{msg.sender_id}",
+                               confidence=msg.payload.get("confidence", CONFIRM_CONFIDENCE),
+                               tick=msg.tick, category=RELATIONAL)
+
+    def on_refuse(self, msg):
+        self.refusals[msg.sender_id] = msg.tick
+        plan = self.model.team_plans.get(self.team)
+        if plan is None or plan.plan_id != msg.payload.get("plan_id"):
+            return
+        for index, step in enumerate(plan.steps):
+            if step.actor_id == msg.sender_id and plan.status.get(index, (None,))[0] == REQUEST:
+                plan.status[index] = (REFUSE, self.model.steps)
+
+    # --- Cote coureur : executer la tache acceptee ------------------------
+    def task_action(self):
+        if self.task is None:
+            owner = self.belief("ball_owner")
+            if owner is not None and owner.team == self.team:
+                return ("SUPPORT", owner)
+            return ("MOVE_TO_BALL", None)
+        target = self.task["target"]
+        if self.distance_to(target) > RUN_DONE_DIST:
+            return ("RUN_TO", target)
+        return ("HOLD", None)   # arrive : attendre la passe
+
+    # --- Envoi spontane (fin de cycle) -------------------------------------
+    def communicate(self):
+        """Echange des informations avec les autres agents."""
+        if not self.model.communication:
+            return
+        self.update_task()
+        owner = self.belief("ball_owner")
+
+        # 4.3 etape 5 : le coureur engage signale tout changement de marquage
+        if self.task is not None:
+            free_now = self.belief("nearest_opp_dist") >= FREE_MARGIN
+            if free_now != self.last_reported_free:
+                self.last_reported_free = free_now
+                self.send(self.task["carrier"], INFORM, f"mate_free:{self.name}",
+                          value=free_now, confidence=SELF_REPORT_CONFIDENCE)
+            return
+
+        # PROPOSE : un joueur libre et devant le porteur se propose
+        if (owner is not None and owner.team == self.team and owner is not self
+                and self.belief("pressure") == "LOW"
+                and self.forward(self.pos[0]) > self.forward(owner.pos[0]) + AHEAD_MARGIN
+                and self.model.steps - self.last_proposal_tick >= PROPOSE_INTERVAL):
+            self.last_proposal_tick = self.model.steps
+            self.send(owner.name, PROPOSE, RECEIVE, zone=self.zone_id(self.pos))
+
+    def update_task(self):
+        """Une tache acceptee s'eteint si l'equipe perd le ballon, si je le
+        recois (tache accomplie) ou si elle dure trop longtemps."""
+        if self.task is None:
+            return
+        owner = self.model.get_ball_owner()
+        if owner is self:
+            self.bdi_events.append("tache accomplie : ballon recu")
+            self.task = None
+        elif owner is None or owner.team != self.team:
+            self.task = None
+        elif self.model.steps - self.task["since"] > TASK_TIMEOUT:
+            self.bdi_events.append("tache expiree")
+            self.task = None
 
     # =================================================================
     # TP 1.3  Regles de production (architecture "REACTIVE", porteur)
@@ -952,10 +1233,6 @@ class PlayerAgent(mesa.Agent):
 
     def deliberate(self):
         """Voir bdi_deliberation()."""
-        pass
-
-    def communicate(self):
-        """TP 4 : messages entre agents."""
         pass
 
     def act(self):

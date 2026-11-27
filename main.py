@@ -19,6 +19,7 @@ def main():
           f" | Tirs : {model.total_shots}")
     print(f"Plans crees : {model.plans_created} | Replanifications : "
           f"{model.total_replans}")
+    print(f"Messages : {model.total_messages} {model.bus.by_performative}")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import mesa
 from mesa.space import ContinuousSpace
 
 from agents import PlayerAgent
+from messages import MessageBus
 
 # --- Dimensions du terrain (metres) ----------------------------------------
 FIELD_W = 105.0
@@ -75,11 +76,12 @@ class Ball:
 
 class FootballModel(mesa.Model):
 
-    def __init__(self, seed=None, verbose=True, architecture="BDI_PLAN",
+    def __init__(self, seed=None, verbose=True, architecture="HYBRID",
                  commitment="single", plan_mode="closed"):
         """architecture : "REACTIVE" (TP 1 : automate + regles)
                           "BDI"      (TP 2 : croyances, desirs, intentions)
                           "BDI_PLAN" (TP 3 : BDI + planification)
+                          "HYBRID"   (TP 4 : BDI + planification + communication)
         commitment   : engagement BDI, "blind", "single" ou "open"
         plan_mode    : "closed" (verifie le plan a chaque tick et replanifie)
                        ou "open" (execute la sequence prevue sans verifier)
@@ -88,8 +90,10 @@ class FootballModel(mesa.Model):
         self.architecture = architecture
         self.commitment = commitment
         self.planning = architecture in ("BDI_PLAN", "HYBRID")
+        self.communication = architecture == "HYBRID"
         self.plan_mode = plan_mode
-        self.team_plans = {}     # {equipe: TeamPlan} plan d'equipe partage
+        self.team_plans = {}     # {equipe: TeamPlan} plan du porteur de chaque equipe
+        self.bus = MessageBus(self)
         self.verbose = verbose   # affiche les evenements (prises, buts)
         # journal des joueurs : True / False, ou un ensemble de noms de joueurs
         self.trace = verbose
@@ -270,6 +274,12 @@ class FootballModel(mesa.Model):
         # 3. regles du jeu
         self.resolve_ball()
         self.check_goal()
+        # 4. les messages du tick seront lus au debut du tick suivant
+        self.bus.deliver()
+
+    @property
+    def total_messages(self):
+        return self.bus.total
 
     def log(self, text):
         if self.verbose:

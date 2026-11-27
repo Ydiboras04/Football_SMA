@@ -296,6 +296,8 @@ def think(agent):
     """Un cycle de decision SANS execution : on montre le plan choisi."""
     agent.bdi_events = []
     agent.revise_beliefs_from(agent.perceive())
+    agent.process_messages()
+    agent.derive_teammate_beliefs()
     agent.last_action = agent.deliberative_layer()
     agent.last_result = None
     agent.inhibited_decision = None
@@ -411,6 +413,97 @@ def tp3_open_vs_closed():
               f"{plans:>7}{replans:>9}")
 
 
+# =============================================================================
+# TP 4 - Communication et coordination
+# =============================================================================
+def manual_tick(model, names, label=None, before=None):
+    """Un tick ou seuls les joueurs `names` agissent (les autres sont figes),
+    puis les messages sont remis : scenario entierement controle."""
+    model.steps += 1
+    if label:
+        print(f"\n--- tick {model.steps} : {label}")
+    if before:
+        before()
+    for name in names:
+        model.get_player(name).step()
+    model.bus.deliver()
+
+
+def tp4_protocol():
+    title("TP4 - Mini-protocole 4.3 (joueurs adverses figes, deplaces a la main)\n"
+          "1. RM1 a l'intention CREATE_SHOT     2. REQUEST de course\n"
+          "3. verification + CONFIRM (ou REFUSE) 4. passe planifiee apres confirmation\n"
+          "5. INFORM si le coureur est marque    6. revision + replanification")
+    model = set_scene({
+        f"{RM}1": (45.0, 34.0),   # porteur
+        f"{BA}3": (47.5, 34.0),   # le presse (2.5 m) : pas de conduite possible
+        f"{RM}3": (55.0, 50.0),   # attaquant... marque par BA2
+        f"{BA}2": (56.0, 51.0),
+        f"{RM}2": (35.0, 8.0),    # milieu libre, hors du champ de vision de RM1
+        f"{BA}1": (88.0, 34.0),
+    }, carrier=f"{RM}1", architecture="HYBRID", seed=0)
+    model.trace = {f"{RM}1", f"{RM}2", f"{RM}3"}
+    rm1 = model.get_player(f"{RM}1")
+    team = [f"{RM}1", f"{RM}2", f"{RM}3"]
+
+    # 1. l'intention est la premisse du protocole
+    model.steps = 0
+    rm1.revise_beliefs_from(rm1.perceive())
+    rm1.derive_teammate_beliefs()
+    rm1.adopt("CREATE_SHOT", "imposee par le scenario")
+
+    ba3 = model.get_player(f"{BA}3")
+
+    def keep_pressing():
+        """BA3 reste colle a 2.5 m devant RM1 (pression HIGH, sans tacle)."""
+        model.space.move_agent(ba3, (rm1.pos[0] + 2.5, rm1.pos[1]))
+
+    def tick(label):
+        manual_tick(model, team, label, before=keep_pressing)
+
+    tick("RM1 planifie et DEMANDE une course a l'attaquant RM3")
+    tick("RM3 verifie ses croyances : il est marque -> REFUSE")
+    tick("RM1 recoit le refus, replanifie sans RM3, demande a RM2")
+    tick("RM2 verifie ses croyances, accepte -> CONFIRM (engagement)")
+    tick("RM1 recoit la confirmation : la passe attend la fin de la course")
+
+    rm2 = model.get_player(f"{RM}2")
+    model.space.move_agent(model.get_player(f"{BA}2"),
+                           (rm2.pos[0] - 1.0, rm2.pos[1] - 2.0))
+    print(f"\n   ... BA2 quitte RM3 et vient marquer RM2, a la limite du champ de "
+          f"vision de RM1 (RM1-BA2 = "
+          f"{rm1.distance_to(model.get_player(f'{BA}2').pos):.1f} m) :\n"
+          f"   RM1 le voit mal, sa perception du marquage est peu fiable ...")
+    tick("RM2 se voit marque -> INFORM a RM1")
+    tick("RM1 revise sa croyance (message) et replanifie")
+    tick("suite")
+
+    b = rm1.beliefs.get(f"mate_free:{RM}2")
+    print(f"\nCroyance finale de RM1 sur RM2 : mate_free = {b.value} "
+          f"(source {b.source}, confiance {b.confidence})")
+    print(f"Messages echanges : {model.bus.total} {model.bus.by_performative}")
+
+
+def tp4_comparison():
+    title("TP4 - Effet de la communication (10 matchs chacun)")
+    print(f"   {'architecture':<12}{'buts':>6}{'tirs':>6}{'passes ok/tentees':>19}"
+          f"{'replans':>9}{'messages':>10}")
+    for arch in ("BDI_PLAN", "HYBRID"):
+        goals = shots = ok = tried = replans = msgs = 0
+        for seed in range(10):
+            m = FootballModel(seed=seed, verbose=False, architecture=arch)
+            for _ in range(600):
+                m.step()
+            goals += sum(m.score.values())
+            shots += m.total_shots
+            ok += m.successful_passes
+            tried += m.total_passes
+            replans += m.total_replans
+            msgs += m.total_messages
+        print(f"   {arch:<12}{goals:>6}{shots:>6}{f'{ok}/{tried}':>19}"
+              f"{replans:>9}{msgs:>10}")
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("all", "tp1"):
@@ -428,3 +521,6 @@ if __name__ == "__main__":
         tp3_multiagent_execution()
         tp3_resource_conflict()
         tp3_open_vs_closed()
+    if which in ("all", "tp4"):
+        tp4_protocol()
+        tp4_comparison()
