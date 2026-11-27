@@ -28,6 +28,7 @@ import math
 import mesa
 
 from beliefs import ENVIRONMENT, PERSONAL, RELATIONAL, SOCIAL, BeliefBase
+from learning import compute_reward, zone_label
 from messages import (CONFIRM, INFORM, PROPOSE, RECEIVE, REFUSE, REQUEST,
                       RUN_INTO_SPACE, TASK_CANCELLED, Message)
 from planning import (GOAL, HAS_BALL, MATE_FREE, NO_PRESSURE, ZONE_ORDER,
@@ -148,6 +149,10 @@ class PlayerAgent(mesa.Agent):
         self.messages_sent = 0
         self.messages_received = 0
 
+        # --- Apprentissage (TP 5) ---
+        self.pending_transition = None     # (s, a) en attente de son renforcement
+        self.last_reward = 0.0
+
         # --- Explicabilite ---
         self.last_module = None
         self.last_rule = None
@@ -171,6 +176,23 @@ class PlayerAgent(mesa.Agent):
         """Abscisse mesuree dans le sens d'attaque de l'equipe."""
         return x * self.model.attack_direction(self.team)
 
+    # --- Architecture de l'equipe (peut differer d'une equipe a l'autre) ---
+    @property
+    def architecture(self):
+        return self.model.architecture_of(self.team)
+
+    @property
+    def uses_planning(self):
+        return self.architecture in ("BDI_PLAN", "HYBRID")
+
+    @property
+    def uses_communication(self):
+        return self.architecture == "HYBRID"
+
+    @property
+    def learner(self):
+        return self.model.learners.get(self.team)
+
     # =================================================================
     # CYCLE
     # =================================================================
@@ -183,6 +205,9 @@ class PlayerAgent(mesa.Agent):
         # TP 4 : informations sociales (messages recus au tick precedent)
         self.process_messages()
         self.derive_teammate_beliefs()
+
+        # TP 5 : renforcement de la decision du tick precedent (s, a) -> r, s'
+        self.learn_from_pending()
 
         # La couche reactive est consultee en premier...
         urgent = self.reactive_layer()
@@ -197,11 +222,14 @@ class PlayerAgent(mesa.Agent):
             self.inhibited_decision = decision
             self.last_module = reactive_module
             self.applicable_rules = []
+            self.pending_transition = None   # l'action apprise n'a pas ete jouee
             self.execute(urgent)
         else:
             self.inhibited_decision = None
             result = self.execute(decision)
             self.finish_plan_step(self.pending_plan_step, result)
+            if self.pending_transition is not None:
+                self.pending_transition["result"] = result
 
         self.communicate()
         self.log_tick()
@@ -376,7 +404,12 @@ class PlayerAgent(mesa.Agent):
     # =================================================================
     def deliberative_layer(self):
         self.transition_state()
-        if self.model.architecture != "REACTIVE":
+        if self.architecture == "RL":
+            # TP 5 : le porteur choisit par Q-learning, les autres par l'automate
+            if self.belief("has_ball"):
+                return self.rl_decision()
+            return self.automaton_decision()
+        if self.architecture != "REACTIVE":
             return self.bdi_deliberation()
         if self.belief("has_ball"):
             return self.production_decision()
@@ -412,7 +445,7 @@ class PlayerAgent(mesa.Agent):
                      and self.intention != "CREATE_SHOT" else [])
         if self.belief("has_ball"):
             desires = ["SCORE", "KEEP_POSSESSION", "PROGRESS"]
-            if self.model.planning:
+            if self.uses_planning:
                 desires.append("CREATE_SHOT")
             return desires + plan_task
         owner = self.belief("ball_owner")
@@ -546,7 +579,7 @@ class PlayerAgent(mesa.Agent):
         if i == "CREATE_SHOT":
             return self.model.team_shots[self.team] > self.intention_context["shots"]
         if i == "FOLLOW_PLAN":
-            if self.model.communication and not b("has_ball"):
+            if self.uses_communication and not b("has_ball"):
                 return False   # la tache acceptee dure jusqu'a la passe (ou annulation)
             plan = self.model.team_plans.get(self.team)
             return plan is not None and not plan.pending_for(self.name)
@@ -627,7 +660,7 @@ class PlayerAgent(mesa.Agent):
         """Prochaine etape du plan d'equipe confiee a ce joueur, ou None.
         Avec communication (TP 4), un joueur sans ballon ne lit pas le plan
         du porteur : sa seule tache est celle qu'il a acceptee par message."""
-        if self.model.communication and not self.belief("has_ball"):
+        if self.uses_communication and not self.belief("has_ball"):
             return self.task
         plan = self.model.team_plans.get(self.team)
         if plan is None:
@@ -664,7 +697,7 @@ class PlayerAgent(mesa.Agent):
 
     # --- Execution du plan (boucle fermee ou ouverte) ---------------------
     def plan_action(self):
-        if self.model.communication and not self.belief("has_ball"):
+        if self.uses_communication and not self.belief("has_ball"):
             return self.task_action()
         plan = self.model.team_plans.get(self.team)
         if self.belief("has_ball"):
@@ -717,7 +750,7 @@ class PlayerAgent(mesa.Agent):
             return "plan termine"
         if step.kind in ("DRIBBLE", "PASS", "SHOOT") and step.actor_id != self.name:
             return f"le porteur devait etre {step.actor_id}"
-        if self.model.communication and step.kind == "RUN":
+        if self.uses_communication and step.kind == "RUN":
             status, since = plan.status.get(plan.index, (None, None))
             if status == REFUSE:
                 return f"{step.actor_id} a refuse la course"
@@ -751,7 +784,7 @@ class PlayerAgent(mesa.Agent):
                 runner = self.model.get_player(step.actor_id)
                 done = (runner.distance_to(step.target_pos) < RUN_DONE_DIST
                         or (state is not None and self.free_mate_ahead(runner)))
-                if self.model.communication:
+                if self.uses_communication:
                     # 4.3 : pas de passe tant que la course n'est pas confirmee
                     done = done and plan.status.get(plan.index, (None,))[0] == CONFIRM
             else:
@@ -910,7 +943,7 @@ class PlayerAgent(mesa.Agent):
     # --- Cote porteur : demander, suivre, annuler -------------------------
     def request_current_task(self, plan):
         """4.3 etape 2 : la course n'est pas imposee, elle est DEMANDEE."""
-        if not self.model.communication or plan is None:
+        if not self.uses_communication or plan is None:
             return
         step = plan.current()
         if step is None or step.kind != "RUN" or plan.index in plan.status:
@@ -920,7 +953,7 @@ class PlayerAgent(mesa.Agent):
                   target=step.target_pos, plan_id=plan.plan_id)
 
     def cancel_requested_tasks(self, plan):
-        if not self.model.communication:
+        if not self.uses_communication:
             return
         for index, (status, _) in plan.status.items():
             if status in (REQUEST, CONFIRM):
@@ -929,7 +962,7 @@ class PlayerAgent(mesa.Agent):
 
     def unavailable_mates(self):
         """Coequipiers a ne pas solliciter : refus recent ou marquage signale."""
-        if not self.model.communication:
+        if not self.uses_communication:
             return set()
         now = self.model.steps
         names = {n for n, t in self.refusals.items() if now - t <= REFUSAL_MEMORY}
@@ -1044,7 +1077,7 @@ class PlayerAgent(mesa.Agent):
     # --- Envoi spontane (fin de cycle) -------------------------------------
     def communicate(self):
         """Echange des informations avec les autres agents."""
-        if not self.model.communication:
+        if not self.uses_communication:
             return
         self.update_task()
         owner = self.belief("ball_owner")
@@ -1132,6 +1165,8 @@ class PlayerAgent(mesa.Agent):
         name, arg = action
         self.last_action = action
         result = None
+        if self.has_ball:
+            self.model.carrier_actions[self.team][name] += 1
 
         if name in ("MOVE_TO_BALL", "PRESS", "INTERCEPT"):
             self.move_toward(self.model.ball.pos)
@@ -1240,8 +1275,91 @@ class PlayerAgent(mesa.Agent):
         pass
 
     def learn(self, transition):
-        """TP 5 : Q-learning."""
-        pass
+        """Met a jour la politique apres observation d'un retour :
+        transition = (s, a, r, s', actions possibles en s')."""
+        return self.learner.update(*transition)
+
+    # =================================================================
+    # TP 5  APPRENTISSAGE PAR RENFORCEMENT
+    # =================================================================
+    def rl_state(self):
+        """5.2 : x = (zone, pression, possession, coequipier libre)."""
+        return (zone_label(self.belief("goal_dist")),
+                self.belief("pressure"),
+                bool(self.belief("has_ball")),
+                self.belief("best_mate") is not None)
+
+    def rl_available(self):
+        """U(x) : PASS n'est possible que s'il y a un coequipier libre."""
+        if not self.belief("has_ball"):
+            return []
+        actions = ["DRIBBLE", "SHOOT"]
+        if self.belief("best_mate") is not None:
+            actions.insert(0, "PASS")
+        return actions
+
+    def rl_decision(self):
+        state = self.rl_state()
+        action, explored = self.learner.choose(state, self.rl_available())
+        self.applicable_rules = []
+        self.last_module = (f"Q-LEARNING:{'exploration' if explored else 'exploitation'}"
+                            f" Q={self.learner.value(state, action):+.2f}")
+        mate = self.belief("best_mate")
+        if self.learner.pass_target == "nearest" and mate is not None:
+            free = [m for m in self.visible_mates
+                    if m.name in self.belief("free_mates")]
+            mate = min(free, key=lambda m: self.distance_to(m.pos), default=mate)
+        ball_dist = self.goal_dist_of(self.belief("ball_position"))
+        self.pending_transition = {
+            "state": state, "action": action,
+            "score": self.model.score[self.team],
+            "ball_zone": zone_label(ball_dist),
+            "pass_gain": (self.forward(mate.pos[0]) - self.forward(self.pos[0])
+                          if mate is not None else 0.0),
+            "shot_dist": self.belief("goal_dist"),
+            "result": None,
+        }
+        if action == "PASS":
+            return ("PASS", mate)
+        return (action, None)
+
+    def learn_from_pending(self):
+        """5.6 : boucle perception -> action -> renforcement. La decision du
+        tick precedent est evaluee maintenant que ses effets sont connus."""
+        p = self.pending_transition
+        if p is None or self.learner is None:
+            return
+        self.pending_transition = None
+        owner = self.model.get_ball_owner()
+        team_has_ball = owner is not None and owner.team == self.team
+        goal = self.model.score[self.team] > p["score"]
+        result = p["result"]
+        ball_dist = self.goal_dist_of(self.model.ball.pos)
+        event = {
+            "goal": goal,
+            "pass_result": result if p["action"] == "PASS" else None,
+            "pass_gain": p["pass_gain"],
+            "shot_result": result if p["action"] == "SHOOT" else None,
+            "shot_dist": p["shot_dist"],
+            "entered_shooting_zone": (team_has_ball and p["ball_zone"] != "SHOOTING"
+                                      and zone_label(ball_dist) == "SHOOTING"),
+            # un tir rate rend aussi le ballon : c'est une perte de possession.
+            # (Sans cela, tirer de loin devenait le moyen le moins cher de
+            # "se debarrasser" du ballon : -3 au lieu de -6, voir TP 5.)
+            "ball_lost": not team_has_ball and not goal,
+        }
+        reward, reasons = compute_reward(self.learner.rewards, event)
+        next_state = self.rl_state()
+        change = self.learn((p["state"], p["action"], reward, next_state,
+                             self.rl_available()))
+        if event["ball_lost"]:
+            self.learner.ball_losses += 1
+        self.last_reward = reward
+        if change is not None and reward != 0:
+            old, new = change
+            self.bdi_events.append(
+                f"Q-update : Q({p['state']}, {p['action']}) {old:+.2f} -> {new:+.2f}"
+                f"  r={reward:+.0f} [{', '.join(reasons)}]")
 
     # =================================================================
     # JOURNAL
@@ -1255,10 +1373,10 @@ class PlayerAgent(mesa.Agent):
     def log_tick(self):
         if not self.traced():
             return
-        if self.model.architecture != "REACTIVE":
-            self.log_bdi()
-        else:
+        if self.architecture in ("REACTIVE", "RL"):
             self.log_reactive()
+        else:
+            self.log_bdi()
 
     @staticmethod
     def _name(value):
@@ -1286,6 +1404,9 @@ class PlayerAgent(mesa.Agent):
         if self.applicable_rules:
             line += f" (applicables={self.applicable_rules})"
         self.model.log(line + f" | action={self._action_text()}")
+        for event in self.bdi_events:
+            if event.startswith("Q-update"):
+                self.model.log(f"{'':13}  {event}")
 
     def log_bdi(self):
         b = self.belief

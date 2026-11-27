@@ -1,9 +1,11 @@
 import math
+from collections import Counter
 
 import mesa
 from mesa.space import ContinuousSpace
 
 from agents import PlayerAgent
+from learning import QLearner
 from messages import MessageBus
 
 # --- Dimensions du terrain (metres) ----------------------------------------
@@ -21,7 +23,7 @@ TACKLE_PROB = 0.3     # probabilite de reussite d'un tacle par tick
 INTERCEPT_RADIUS = 2.0  # un adversaire a moins de 2 m de la trajectoire peut couper
 INTERCEPT_PROB = 0.5    # probabilite qu'il intercepte effectivement
 PASS_MAX_RANGE = 40.0   # au-dela, la passe est tres imprecise
-SHOT_RANGE_SCALE = 25.0 # probabilite de marquer = 0.75 - distance / 25
+SHOT_RANGE_SCALE = 25.0 # probabilite de marquer = 0.75 - distance / 25 (nulle > 18.75 m)
 
 # --- Equipes ------------------------------------------------------------------
 # Le reste du code ne depend jamais du nom des equipes, seulement de leur cote :
@@ -77,20 +79,29 @@ class Ball:
 class FootballModel(mesa.Model):
 
     def __init__(self, seed=None, verbose=True, architecture="HYBRID",
-                 commitment="single", plan_mode="closed"):
+                 commitment="single", plan_mode="closed",
+                 team_architectures=None, learners=None):
         """architecture : "REACTIVE" (TP 1 : automate + regles)
                           "BDI"      (TP 2 : croyances, desirs, intentions)
                           "BDI_PLAN" (TP 3 : BDI + planification)
                           "HYBRID"   (TP 4 : BDI + planification + communication)
+                          "RL"       (TP 5 : TP 1 avec Q-learning pour le porteur)
+        team_architectures : {equipe: architecture} pour qu'une equipe joue
+                       differemment de l'autre (ex. une equipe apprend contre
+                       un adversaire a regles fixes)
+        learners     : {equipe: QLearner} partages d'un episode a l'autre
         commitment   : engagement BDI, "blind", "single" ou "open"
         plan_mode    : "closed" (verifie le plan a chaque tick et replanifie)
                        ou "open" (execute la sequence prevue sans verifier)
         """
         super().__init__(rng=seed)
         self.architecture = architecture
+        self.team_architectures = dict(team_architectures or {})
+        self.learners = dict(learners or {})
+        for team in (LEFT_TEAM, RIGHT_TEAM):
+            if self.architecture_of(team) == "RL" and team not in self.learners:
+                self.learners[team] = QLearner(seed=seed)
         self.commitment = commitment
-        self.planning = architecture in ("BDI_PLAN", "HYBRID")
-        self.communication = architecture == "HYBRID"
         self.plan_mode = plan_mode
         self.team_plans = {}     # {equipe: TeamPlan} plan du porteur de chaque equipe
         self.bus = MessageBus(self)
@@ -108,12 +119,20 @@ class FootballModel(mesa.Model):
         self.team_shots = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
         self.total_replans = 0
         self.plans_created = 0
+        # TP 5 : indicateurs par equipe, identiques quelle que soit l'architecture
+        self.carrier_actions = {LEFT_TEAM: Counter(), RIGHT_TEAM: Counter()}
+        self.ball_losses = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
+        self.team_passes = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
+        self.lateral_passes = {LEFT_TEAM: 0, RIGHT_TEAM: 0}  # gain < 5 m
 
         formations = {LEFT_TEAM: FORMATION_A, RIGHT_TEAM: FORMATION_B}
         for team, formation in formations.items():
             for i, (role, home) in enumerate(formation, start=1):
                 player = PlayerAgent(self, team, role, name=f"{team}{i}", home=home)
                 self.space.place_agent(player, home)
+
+    def architecture_of(self, team):
+        return self.team_architectures.get(team, self.architecture)
 
     def get_ball_owner(self):
         return self.ball.owner
@@ -173,6 +192,7 @@ class FootballModel(mesa.Model):
                     and distance(p.pos, owner.pos) <= TACKLE_RADIUS]
         for p in tacklers:
             if self.random.random() < TACKLE_PROB:
+                self.ball_losses[owner.team] += 1
                 self.give_ball(p)
                 self.log(f"{p.name} prend le ballon a {owner.name}")
                 return
@@ -195,12 +215,17 @@ class FootballModel(mesa.Model):
         """
         self.total_passes += 1
         start, end = passer.pos, receiver.pos
+        self.team_passes[passer.team] += 1
+        gain = (end[0] - start[0]) * self.attack_direction(passer.team)
+        if gain < 5.0:
+            self.lateral_passes[passer.team] += 1
 
         for opp in self.players():
             if opp.team == passer.team:
                 continue
             if (distance_to_segment(opp.pos, start, end) <= INTERCEPT_RADIUS
                     and self.random.random() < INTERCEPT_PROB):
+                self.ball_losses[passer.team] += 1
                 self.give_ball(opp)
                 self.log(f"passe {passer.name} -> {receiver.name} "
                          f"INTERCEPTEE par {opp.name}")
@@ -214,6 +239,7 @@ class FootballModel(mesa.Model):
             return "PASS_OK"
 
         offset = (self.random.uniform(-4, 4), self.random.uniform(-4, 4))
+        self.ball_losses[passer.team] += 1
         self.drop_ball((end[0] + offset[0], end[1] + offset[1]))
         self.log(f"passe {passer.name} -> {receiver.name} ratee, ballon libre")
         return "PASS_MISSED"
@@ -228,7 +254,9 @@ class FootballModel(mesa.Model):
         self.team_shots[shooter.team] += 1
         goal = self.opponent_goal(shooter.team)
         dist = distance(shooter.pos, goal)
-        p_goal = max(0.05, 0.75 - dist / SHOT_RANGE_SCALE)
+        # Pas de plancher : un ancien plancher de 5 % "de n'importe ou" a ete
+        # exploite par le Q-learning (tirs depuis sa propre moitie, TP 5).
+        p_goal = max(0.0, 0.75 - dist / SHOT_RANGE_SCALE)
 
         if self.random.random() < p_goal:
             self.log(f"{shooter.name} tire de {dist:.1f} m ... BUT !")

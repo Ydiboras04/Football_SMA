@@ -17,6 +17,7 @@ python main.py          # un match complet
 python experiments.py   # scenarios controles (tests des TP)
 python experiments.py tp3
 python experiments.py tp4
+python experiments.py tp5   # entrainement Q-learning (~1 min), CSV dans results/
 ```
 
 Le modele accepte plusieurs architectures de joueur :
@@ -26,6 +27,11 @@ FootballModel(architecture="REACTIVE")                  # TP 1 : automate + regl
 FootballModel(architecture="BDI", commitment="single")  # TP 2 : "blind" | "single" | "open"
 FootballModel(architecture="BDI_PLAN", plan_mode="closed")  # TP 3 : "closed" | "open"
 FootballModel(architecture="HYBRID")                    # TP 4 : + communication (defaut)
+
+# TP 5 : une equipe apprend (Q-learning) contre un adversaire a regles fixes
+learner = QLearner(epsilon=0.2)
+FootballModel(team_architectures={"REAL_MADRID": "RL", "BARCELONA": "REACTIVE"},
+              learners={"REAL_MADRID": learner})
 ```
 
 ## Architecture du joueur (TP 1)

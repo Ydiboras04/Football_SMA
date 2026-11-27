@@ -504,6 +504,185 @@ def tp4_comparison():
               f"{replans:>9}{msgs:>10}")
 
 
+# =============================================================================
+# TP 5 - Apprentissage par renforcement
+# =============================================================================
+import csv  # noqa: E402
+import os  # noqa: E402
+
+from learning import QLearner  # noqa: E402
+
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+TRAIN_SEEDS = range(0, 40)       # episodes d'entrainement
+EVAL_SEEDS = range(1000, 1020)   # episodes d'evaluation, jamais vus a l'entrainement
+EPISODE_TICKS = 600
+LEARNER_TEAM, OPPONENT = RM, BA  # RM apprend, BA garde les regles du TP 1
+
+
+def run_episode(seed, learner=None, architecture="RL"):
+    """Un match : RM (RL ou autre architecture) contre BA a regles fixes."""
+    teams = {LEARNER_TEAM: architecture, OPPONENT: "REACTIVE"}
+    learners = {LEARNER_TEAM: learner} if learner is not None else {}
+    if learner is not None:
+        learner.reset_stats()
+    m = FootballModel(seed=seed, verbose=False, team_architectures=teams,
+                      learners=learners)
+    for _ in range(EPISODE_TICKS):
+        m.step()
+    acts = m.carrier_actions[LEARNER_TEAM]
+    on_ball = sum(acts[a] for a in ("PASS", "DRIBBLE", "SHOOT")) or 1
+    decisions = learner.decisions if learner is not None else on_ball
+    return {
+        "seed": seed,
+        "epsilon": round(learner.epsilon, 3) if learner is not None else "",
+        "decisions": decisions,
+        "mean_reward": (learner.total_reward / max(learner.decisions, 1)
+                        if learner is not None else ""),
+        "loss_rate": m.ball_losses[LEARNER_TEAM] / on_ball,
+        "pass": acts["PASS"] / on_ball,
+        "dribble": acts["DRIBBLE"] / on_ball,
+        "shoot": acts["SHOOT"] / on_ball,
+        "lateral_pass": (m.lateral_passes[LEARNER_TEAM]
+                         / max(m.team_passes[LEARNER_TEAM], 1)),
+        "goals_for": m.score[LEARNER_TEAM],
+        "goals_against": m.score[OPPONENT],
+    }
+
+
+def epsilon_schedule(kind, episode, n_episodes):
+    if kind == "decay":   # 0.5 -> 0.05, lineaire
+        return 0.5 + (0.05 - 0.5) * episode / max(n_episodes - 1, 1)
+    return float(kind)
+
+
+def train_and_evaluate(name, schedule, reward_table="default", pass_target="best"):
+    learner = QLearner(epsilon=epsilon_schedule(schedule, 0, len(TRAIN_SEEDS)),
+                       reward_table=reward_table, pass_target=pass_target, seed=0)
+    train = []
+    for k, seed in enumerate(TRAIN_SEEDS):
+        learner.epsilon = epsilon_schedule(schedule, k, len(TRAIN_SEEDS))
+        train.append(run_episode(seed, learner) | {"phase": "train"})
+
+    # Evaluation : episodes separes, sans apprentissage ni exploration
+    learner.learning = False
+    learner.epsilon = 0.0
+    frozen = dict(learner.q)
+    evaluation = [run_episode(seed, learner) | {"phase": "eval"}
+                  for seed in EVAL_SEEDS]
+    assert dict(learner.q) == frozen, "Q a change pendant l'evaluation"
+
+    export_csv(f"tp5_{name}.csv", train + evaluation)
+    return learner, train, evaluation
+
+
+def export_csv(filename, rows):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    path = os.path.join(RESULTS_DIR, filename)
+    fields = ["phase", "seed", "epsilon", "decisions", "mean_reward", "loss_rate",
+              "pass", "dribble", "shoot", "lateral_pass", "goals_for",
+              "goals_against"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def mean(rows, key):
+    values = [r[key] for r in rows if r[key] != ""]
+    return sum(values) / len(values) if values else float("nan")
+
+
+def summary_line(label, rows):
+    reward = mean(rows, "mean_reward")
+    reward_text = f"{reward:+7.2f}" if reward == reward else "      -"
+    return (f"   {label:<20}{reward_text}{mean(rows, 'loss_rate'):>8.1%}"
+            f"{mean(rows, 'pass'):>7.0%}{mean(rows, 'dribble'):>8.0%}"
+            f"{mean(rows, 'shoot'):>7.0%}{mean(rows, 'lateral_pass'):>9.0%}"
+            f"{sum(r['goals_for'] for r in rows):>6}"
+            f"{sum(r['goals_against'] for r in rows):>5}")
+
+
+SUMMARY_HEADER = (f"   {'':<20}{'r/dec':>7}{'pertes':>8}{'PASS':>7}{'DRIBBLE':>8}"
+                  f"{'SHOOT':>7}{'lateral':>9}{'BP':>6}{'BC':>5}")
+
+
+def tp5_exploration():
+    title("TP5 / 5.5 - Exploration / exploitation : 3 reglages de epsilon\n"
+          f"REAL_MADRID apprend ({len(TRAIN_SEEDS)} matchs), puis est evalue sur "
+          f"{len(EVAL_SEEDS)} autres matchs\nsans apprentissage ni exploration, "
+          f"contre BARCELONA a regles fixes (TP 1).\n"
+          "r/dec = recompense moyenne par decision, pertes = pertes de balle par "
+          "action du porteur,\nlateral = part des passes laterales ou en retrait, "
+          "BP/BC = buts pour / contre")
+    configs = [("epsilon_0", "0"), ("epsilon_0.2", "0.2"), ("epsilon_decay", "decay")]
+    results = {}
+    print(SUMMARY_HEADER)
+    for name, schedule in configs:
+        learner, train, evaluation = train_and_evaluate(name, schedule)
+        results[name] = (learner, train, evaluation)
+        print(summary_line(f"{name} debut", train[:5]))
+        print(summary_line(f"{name} fin", train[-5:]))
+        print(summary_line(f"{name} EVAL", evaluation))
+    rules = [run_episode(seed, architecture="REACTIVE") | {"phase": "eval"}
+             for seed in EVAL_SEEDS]
+    export_csv("tp5_rules.csv", rules)
+    print(summary_line("regles TP1 EVAL", rules))
+    print(f"\n   CSV exportes dans {RESULTS_DIR}")
+    return results
+
+
+def tp5_tests(results):
+    learner, train, evaluation = results["epsilon_0.2"]
+    title("TP5 / Tests a reussir (configuration epsilon = 0.2)")
+
+    print("1) Les valeurs Q changent apres une recompense non nulle :")
+    for s, a, r, s2, old, new in learner.history[:4]:
+        print(f"   Q({s}, {a}) : {old:+.2f} -> {new:+.2f}   (r = {r:+.0f})")
+
+    print("\n2) Une meme situation peut conduire a plusieurs actions (exploration) :")
+    state, counts = max(learner.state_actions.items(),
+                        key=lambda kv: sum(kv[1].values()))
+    print(f"   etat le plus frequent {state} : {dict(counts)}")
+    greedy = results["epsilon_0"][0]
+    if state in greedy.state_actions:
+        print(f"   meme etat avec epsilon = 0 : {dict(greedy.state_actions[state])}")
+
+    print("\n3) Apres entrainement, la distribution d'actions est differente :")
+    for name, (_, tr, ev) in results.items():
+        first = tr[0]
+        print(f"   {name:<14} 1er match : PASS {first['pass']:>4.0%} DRIBBLE "
+              f"{first['dribble']:>4.0%} SHOOT {first['shoot']:>4.0%}   ->   "
+              f"evaluation : PASS {mean(ev, 'pass'):>4.0%} DRIBBLE "
+              f"{mean(ev, 'dribble'):>4.0%} SHOOT {mean(ev, 'shoot'):>4.0%}")
+
+    print("\n4) Evaluation sur des episodes separes, sans apprentissage :")
+    print(f"   graines d'entrainement {TRAIN_SEEDS.start}-{TRAIN_SEEDS.stop - 1}, "
+          f"d'evaluation {EVAL_SEEDS.start}-{EVAL_SEEDS.stop - 1} ; learning=False, "
+          f"epsilon=0 ; table Q identique avant/apres l'evaluation (verifie)")
+
+    print("\nPolitique apprise (meilleure action par etat, avec ballon) :")
+    for s in learner.known_states():
+        if s[2]:
+            available = ["PASS", "DRIBBLE", "SHOOT"] if s[3] else ["DRIBBLE", "SHOOT"]
+            values = "  ".join(f"{a}={learner.value(s, a):+.1f}" for a in available)
+            print(f"   {str(s):<40} -> {learner.policy(s, available):<8} ({values})")
+
+
+def tp5_scenario_d():
+    title("TP5 / Scenario D - Apprentissage d'un mauvais raccourci\n"
+          "La passe va au coequipier libre le PLUS PROCHE (passe facile).\n"
+          "1. toute passe reussie vaut +10, la progression n'est pas recompensee\n"
+          "2. fonction corrigee (table du sujet) : seule la passe qui progresse vaut +3")
+    print(SUMMARY_HEADER)
+    _, _, bad = train_and_evaluate("scenarioD_shortcut", "decay", "pass_shortcut",
+                                   pass_target="nearest")
+    print(summary_line("raccourci EVAL", bad))
+    _, _, good = train_and_evaluate("scenarioD_fixed", "decay", "default",
+                                    pass_target="nearest")
+    print(summary_line("corrige EVAL", good))
+
+
 if __name__ == "__main__":
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     if which in ("all", "tp1"):
@@ -524,3 +703,6 @@ if __name__ == "__main__":
     if which in ("all", "tp4"):
         tp4_protocol()
         tp4_comparison()
+    if which in ("all", "tp5"):
+        tp5_tests(tp5_exploration())
+        tp5_scenario_d()
