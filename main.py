@@ -1,23 +1,21 @@
-"""Point d'entree : lance un match court et affiche l'etat du terrain."""
+"""Point d'entree : lance un match et affiche le journal du TP 0."""
 
 from model import FootballModel
 
-
-def print_players(model):
-    owner = model.get_ball_owner()
-    print(f"tick {model.steps} | ballon en ({model.ball.pos[0]:.1f}, "
-          f"{model.ball.pos[1]:.1f}) | porteur = {owner.name if owner else None}")
-    for p in sorted(model.players(), key=lambda a: a.name):
-        print(f"   {p.name} ({p.role}) pos=({p.pos[0]:5.1f}, {p.pos[1]:5.1f}) "
-              f"state={p.state}")
+TRACE_TICKS = 5      # nombre de ticks avec le journal detaille de chaque joueur
+MATCH_TICKS = 600    # duree totale du match
 
 
 def main():
     model = FootballModel(seed=42)
-    print_players(model)
-    for _ in range(3):
+
+    for _ in range(MATCH_TICKS):
+        # Journal detaille au debut, puis seulement les evenements.
+        model.trace = model.steps < TRACE_TICKS
         model.step()
-        print_players(model)
+
+    print(f"\nFin du match apres {model.steps} ticks : "
+          f"A {model.score['A']} - {model.score['B']} B")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """Agents joueurs.
 
 TP 0 : agent reactif base sur un automate a 4 etats
-(CHASE, ATTACK, SUPPORT, DEFEND) -- a completer a l'etape 2.
+(CHASE, ATTACK, SUPPORT, DEFEND).
 """
 
 import math
@@ -23,7 +23,6 @@ class PlayerAgent(mesa.Agent):
         self.state = "CHASE"
         self.last_action = None
 
-    # ------------------------------------------------------------ proprietes
     @property
     def has_ball(self):
         return self.model.get_ball_owner() is self
@@ -31,7 +30,6 @@ class PlayerAgent(mesa.Agent):
     def distance_to(self, point):
         return math.hypot(self.pos[0] - point[0], self.pos[1] - point[1])
 
-    # ------------------------------------------------------------ primitive
     def move_toward(self, target, speed=None):
         """Avance d'au plus `speed` metres vers `target`, sans sortir du terrain."""
         if speed is None:
@@ -48,10 +46,81 @@ class PlayerAgent(mesa.Agent):
         y = min(max(y, 0.0), space.y_max - 1e-6)
         space.move_agent(self, (x, y))
 
-    # ------------------------------------------------- interface commune (2.3)
+    # ============================================================ PERCEPTION
     def perceive(self):
-        """Observe localement l'environnement."""
-        pass
+        """Observe localement l'environnement.
+
+        TP 0 : la perception se limite a ce dont l'automate a besoin,
+        le porteur du ballon et la distance au ballon.
+        """
+        owner = self.model.get_ball_owner()
+        ball_pos = self.model.ball.pos
+        return {
+            "owner": owner,
+            "dist_ball": self.distance_to(ball_pos),
+            "closest_mate_to_ball": self.is_closest_of_team_to(ball_pos),
+        }
+
+    def is_closest_of_team_to(self, point):
+        mates = self.model.players(self.team)
+        return min(mates, key=lambda p: p.distance_to(point)) is self
+
+    def transition_state(self, percept):
+        """Fonction de transition de l'automate : choisit l'etat courant
+        a partir du porteur du ballon."""
+        owner = percept["owner"]
+
+        if self.has_ball:
+            self.state = "ATTACK"
+        elif owner is None:
+            self.state = "CHASE"
+        elif owner.team == self.team:
+            self.state = "SUPPORT"
+        else:
+            self.state = "DEFEND"
+
+    # =============================================================== ACTION
+    def reactive_action(self, percept):
+        """Associe une action simple a chaque etat."""
+        if self.state == "CHASE":
+            self.move_toward_ball()
+        elif self.state == "ATTACK":
+            self.move_toward_opponent_goal()
+        elif self.state == "SUPPORT":
+            self.move_to_support_position(percept["owner"])
+        elif self.state == "DEFEND":
+            # La distance au ballon intervient ici : le defenseur le plus
+            # proche presse le porteur, les autres se replacent.
+            if percept["closest_mate_to_ball"]:
+                self.press_carrier()
+            else:
+                self.move_to_defensive_zone()
+
+    def move_toward_ball(self):
+        self.last_action = "move_toward_ball"
+        self.move_toward(self.model.ball.pos)
+
+    def move_toward_opponent_goal(self):
+        self.last_action = "move_toward_opponent_goal"
+        self.move_toward(self.model.opponent_goal(self.team))
+
+    def move_to_support_position(self, owner):
+        """Se placer devant le porteur, decale sur le cote de sa zone."""
+        self.last_action = "move_to_support_position"
+        forward = 10.0 if self.team == "A" else -10.0
+        side = 8.0 if self.home[1] >= owner.pos[1] else -8.0
+        self.move_toward((owner.pos[0] + forward, owner.pos[1] + side))
+
+    def move_to_defensive_zone(self):
+        """Revenir entre sa position de depart et son propre but."""
+        self.last_action = "move_to_defensive_zone"
+        goal = self.model.own_goal(self.team)
+        self.move_toward(((self.home[0] + goal[0]) / 2,
+                          (self.home[1] + goal[1]) / 2))
+
+    def press_carrier(self):
+        self.last_action = "press_carrier"
+        self.move_toward(self.model.ball.pos)
 
     def revise_beliefs(self):
         """Met a jour l'etat interne a partir des perceptions."""
@@ -75,5 +144,19 @@ class PlayerAgent(mesa.Agent):
 
     # ----------------------------------------------------------------- cycle
     def step(self):
-        # Etape 2 : ici on appellera transition_state() puis reactive_action().
-        pass
+        """Boucle perception -> decision -> action du TP 0."""
+        percept = self.perceive()
+        self.transition_state(percept)
+        self.reactive_action(percept)
+        self.log_tick(percept)
+
+    def log_tick(self, percept):
+        """Journal : etat, perception principale, action."""
+        if not self.model.trace:
+            return
+        owner = percept["owner"]
+        self.model.log(
+            f"{self.name} | state={self.state:<7} | "
+            f"owner={owner.name if owner else None}, "
+            f"dist_ball={percept['dist_ball']:5.1f} | {self.last_action}"
+        )

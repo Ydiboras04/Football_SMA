@@ -1,12 +1,3 @@
-"""Environnement et orchestration du match (TP 0).
-
-Le modele contient :
-- un terrain continu de FIELD_W x FIELD_H metres ;
-- deux equipes ("A" attaque vers la droite, "B" vers la gauche) ;
-- un ballon, attache a son porteur dans la version minimale ;
-- les regles simplifiees : prise de balle, tacle, but, remise en jeu.
-"""
-
 import math
 
 import mesa
@@ -25,11 +16,19 @@ CONTROL_RADIUS = 1.0  # distance pour prendre un ballon libre
 TACKLE_RADIUS = 1.0   # distance pour tenter de voler le ballon au porteur
 TACKLE_PROB = 0.3     # probabilite de reussite d'un tacle par tick
 
-# Positions de depart (x, y) pour l'equipe A ; l'equipe B est le miroir.
+# Positions de depart (x, y) de chaque equipe.
+# L'equipe A defend le but de gauche (x = 0) et attaque vers la droite.
 FORMATION_A = [
     ("DEF", (20.0, 34.0)),
     ("MID", (35.0, 20.0)),
     ("ATT", (45.0, 48.0)),
+]
+
+# L'equipe B defend le but de droite (x = 105) et attaque vers la gauche.
+FORMATION_B = [
+    ("DEF", (85.0, 34.0)),
+    ("MID", (70.0, 48.0)),
+    ("ATT", (60.0, 20.0)),
 ]
 
 
@@ -53,19 +52,18 @@ class FootballModel(mesa.Model):
 
     def __init__(self, seed=None, verbose=True):
         super().__init__(rng=seed)
-        self.verbose = verbose
+        self.verbose = verbose   # affiche les evenements (prises, buts)
+        self.trace = verbose     # affiche le journal de chaque joueur
         self.space = ContinuousSpace(FIELD_W, FIELD_H, torus=False)
         self.ball = Ball((FIELD_W / 2, FIELD_H / 2))
         self.score = {"A": 0, "B": 0}
 
-        for team in ("A", "B"):
-            for i, (role, home) in enumerate(FORMATION_A, start=1):
-                if team == "B":
-                    home = (FIELD_W - home[0], FIELD_H - home[1])
+        formations = {"REAL_MADRID": FORMATION_A, "BARCELONA": FORMATION_B}
+        for team, formation in formations.items():
+            for i, (role, home) in enumerate(formation, start=1):
                 player = PlayerAgent(self, team, role, name=f"{team}{i}", home=home)
                 self.space.place_agent(player, home)
 
-    # ------------------------------------------------------------------ API
     def get_ball_owner(self):
         return self.ball.owner
 
