@@ -15,6 +15,8 @@ def main():
         model.step()
 
     print(f"\nFin du match apres {model.steps} ticks : {model.score_text()}")
+    print(f"Passes reussies : {model.successful_passes} / {model.total_passes}"
+          f" | Tirs : {model.total_shots}")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,12 @@ CONTROL_RADIUS = 1.0  # distance pour prendre un ballon libre
 TACKLE_RADIUS = 1.0   # distance pour tenter de voler le ballon au porteur
 TACKLE_PROB = 0.3     # probabilite de reussite d'un tacle par tick
 
+# Passe et tir (TP 1) : actions instantanees, resultat tire au hasard.
+INTERCEPT_RADIUS = 2.0  # un adversaire a moins de 2 m de la trajectoire peut couper
+INTERCEPT_PROB = 0.5    # probabilite qu'il intercepte effectivement
+PASS_MAX_RANGE = 40.0   # au-dela, la passe est tres imprecise
+SHOT_RANGE_SCALE = 25.0 # probabilite de marquer = 0.75 - distance / 25
+
 # --- Equipes ------------------------------------------------------------------
 # Le reste du code ne depend jamais du nom des equipes, seulement de leur cote :
 # changer un nom ici suffit.
@@ -42,6 +48,19 @@ def distance(p, q):
     return math.hypot(p[0] - q[0], p[1] - q[1])
 
 
+def distance_to_segment(p, a, b):
+    """Distance du point p au segment [a, b] (trajectoire d'une passe)."""
+    ax, ay = a
+    bx, by = b
+    dx, dy = bx - ax, by - ay
+    length2 = dx * dx + dy * dy
+    if length2 == 0:
+        return distance(p, a)
+    t = ((p[0] - ax) * dx + (p[1] - ay) * dy) / length2
+    t = max(0.0, min(1.0, t))
+    return distance(p, (ax + t * dx, ay + t * dy))
+
+
 class Ball:
     """Le ballon : soit libre (owner=None), soit colle a son porteur."""
 
@@ -64,6 +83,11 @@ class FootballModel(mesa.Model):
         self.ball = Ball((FIELD_W / 2, FIELD_H / 2))
         self.score = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
 
+        # Indicateurs (utiles pour les comparaisons des TP suivants)
+        self.total_passes = 0
+        self.successful_passes = 0
+        self.total_shots = 0
+
         formations = {LEFT_TEAM: FORMATION_A, RIGHT_TEAM: FORMATION_B}
         for team, formation in formations.items():
             for i, (role, home) in enumerate(formation, start=1):
@@ -75,6 +99,9 @@ class FootballModel(mesa.Model):
 
     def players(self, team=None):
         return [a for a in self.agents if team is None or a.team == team]
+
+    def get_player(self, name):
+        return next(p for p in self.agents if p.name == name)
 
     def attack_direction(self, team):
         """+1 si `team` attaque vers la droite (x croissant), -1 sinon."""
@@ -120,6 +147,69 @@ class FootballModel(mesa.Model):
                 self.give_ball(p)
                 self.log(f"{p.name} prend le ballon a {owner.name}")
                 return
+
+    def drop_ball(self, pos):
+        """Le ballon devient libre a la position `pos` (bornee au terrain)."""
+        x = min(max(pos[0], 0.0), FIELD_W - 1e-6)
+        y = min(max(pos[1], 0.0), FIELD_H - 1e-6)
+        self.ball.owner = None
+        self.ball.pos = (x, y)
+
+    def attempt_pass(self, passer, receiver):
+        """Passe instantanee de `passer` vers `receiver`.
+
+        1. un adversaire proche de la trajectoire peut intercepter ;
+        2. sinon la passe arrive avec une probabilite qui baisse avec la
+           distance ; si elle est ratee, le ballon tombe libre pres du receveur.
+        Renvoie "PASS_OK", "PASS_INTERCEPTED" ou "PASS_MISSED".
+        """
+        self.total_passes += 1
+        start, end = passer.pos, receiver.pos
+
+        for opp in self.players():
+            if opp.team == passer.team:
+                continue
+            if (distance_to_segment(opp.pos, start, end) <= INTERCEPT_RADIUS
+                    and self.random.random() < INTERCEPT_PROB):
+                self.give_ball(opp)
+                self.log(f"passe {passer.name} -> {receiver.name} "
+                         f"INTERCEPTEE par {opp.name}")
+                return "PASS_INTERCEPTED"
+
+        accuracy = max(0.4, 1.0 - distance(start, end) / PASS_MAX_RANGE)
+        if self.random.random() < accuracy:
+            self.give_ball(receiver)
+            self.successful_passes += 1
+            self.log(f"passe {passer.name} -> {receiver.name} reussie")
+            return "PASS_OK"
+
+        offset = (self.random.uniform(-4, 4), self.random.uniform(-4, 4))
+        self.drop_ball((end[0] + offset[0], end[1] + offset[1]))
+        self.log(f"passe {passer.name} -> {receiver.name} ratee, ballon libre")
+        return "PASS_MISSED"
+
+    def attempt_shot(self, shooter):
+        """Tir instantane : probabilite de but decroissante avec la distance.
+        En cas d'echec, le ballon revient au defenseur adverse le plus proche
+        de son but (sortie de but simplifiee).
+        Renvoie "GOAL" ou "SHOT_MISSED".
+        """
+        self.total_shots += 1
+        goal = self.opponent_goal(shooter.team)
+        dist = distance(shooter.pos, goal)
+        p_goal = max(0.05, 0.75 - dist / SHOT_RANGE_SCALE)
+
+        if self.random.random() < p_goal:
+            self.log(f"{shooter.name} tire de {dist:.1f} m ... BUT !")
+            self.goal_scored(shooter.team)
+            return "GOAL"
+
+        defenders = [p for p in self.players() if p.team != shooter.team]
+        keeper = min(defenders, key=lambda p: distance(p.pos, goal))
+        self.give_ball(keeper)
+        self.log(f"{shooter.name} tire de {dist:.1f} m ... rate, "
+                 f"ballon a {keeper.name}")
+        return "SHOT_MISSED"
 
     def check_goal(self):
         owner = self.ball.owner
