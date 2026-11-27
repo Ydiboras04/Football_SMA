@@ -7,15 +7,14 @@ MATCH_TICKS = 600    # duree totale du match
 
 
 def main():
-    model = FootballModel(seed=42)
+    model = FootballModel()
 
     for _ in range(MATCH_TICKS):
         # Journal detaille au debut, puis seulement les evenements.
         model.trace = model.steps < TRACE_TICKS
         model.step()
 
-    print(f"\nFin du match apres {model.steps} ticks : "
-          f"A {model.score['A']} - {model.score['B']} B")
+    print(f"\nFin du match apres {model.steps} ticks : {model.score_text()}")
 
 
 if __name__ == "__main__":

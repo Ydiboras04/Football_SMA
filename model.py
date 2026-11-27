@@ -16,15 +16,21 @@ CONTROL_RADIUS = 1.0  # distance pour prendre un ballon libre
 TACKLE_RADIUS = 1.0   # distance pour tenter de voler le ballon au porteur
 TACKLE_PROB = 0.3     # probabilite de reussite d'un tacle par tick
 
+# --- Equipes ------------------------------------------------------------------
+# Le reste du code ne depend jamais du nom des equipes, seulement de leur cote :
+# changer un nom ici suffit.
+LEFT_TEAM = "REAL_MADRID"   # defend le but de gauche (x = 0), attaque a droite
+RIGHT_TEAM = "BARCELONA"    # defend le but de droite (x = 105), attaque a gauche
+
 # Positions de depart (x, y) de chaque equipe.
-# L'equipe A defend le but de gauche (x = 0) et attaque vers la droite.
+# L'equipe A (LEFT_TEAM) defend le but de gauche (x = 0) et attaque vers la droite.
 FORMATION_A = [
     ("DEF", (20.0, 34.0)),
     ("MID", (35.0, 20.0)),
     ("ATT", (45.0, 48.0)),
 ]
 
-# L'equipe B defend le but de droite (x = 105) et attaque vers la gauche.
+# L'equipe B (RIGHT_TEAM) defend le but de droite (x = 105) et attaque vers la gauche.
 FORMATION_B = [
     ("DEF", (85.0, 34.0)),
     ("MID", (70.0, 48.0)),
@@ -56,9 +62,9 @@ class FootballModel(mesa.Model):
         self.trace = verbose     # affiche le journal de chaque joueur
         self.space = ContinuousSpace(FIELD_W, FIELD_H, torus=False)
         self.ball = Ball((FIELD_W / 2, FIELD_H / 2))
-        self.score = {"A": 0, "B": 0}
+        self.score = {LEFT_TEAM: 0, RIGHT_TEAM: 0}
 
-        formations = {"REAL_MADRID": FORMATION_A, "BARCELONA": FORMATION_B}
+        formations = {LEFT_TEAM: FORMATION_A, RIGHT_TEAM: FORMATION_B}
         for team, formation in formations.items():
             for i, (role, home) in enumerate(formation, start=1):
                 player = PlayerAgent(self, team, role, name=f"{team}{i}", home=home)
@@ -70,13 +76,23 @@ class FootballModel(mesa.Model):
     def players(self, team=None):
         return [a for a in self.agents if team is None or a.team == team]
 
+    def attack_direction(self, team):
+        """+1 si `team` attaque vers la droite (x croissant), -1 sinon."""
+        return 1 if team == LEFT_TEAM else -1
+
     def opponent_goal(self, team):
         """Centre du but que `team` doit attaquer."""
-        x = FIELD_W if team == "A" else 0.0
+        x = FIELD_W if self.attack_direction(team) > 0 else 0.0
         return (x, (GOAL_Y_MIN + GOAL_Y_MAX) / 2)
 
     def own_goal(self, team):
-        return self.opponent_goal("B" if team == "A" else "A")
+        """Centre du but que `team` doit defendre."""
+        x = 0.0 if self.attack_direction(team) > 0 else FIELD_W
+        return (x, (GOAL_Y_MIN + GOAL_Y_MAX) / 2)
+
+    def score_text(self):
+        return (f"{LEFT_TEAM} {self.score[LEFT_TEAM]} - "
+                f"{self.score[RIGHT_TEAM]} {RIGHT_TEAM}")
 
     # ---------------------------------------------------------------- regles
     def give_ball(self, player):
@@ -111,15 +127,13 @@ class FootballModel(mesa.Model):
             return
         x, y = owner.pos
         in_goal_mouth = GOAL_Y_MIN <= y <= GOAL_Y_MAX
-        if owner.team == "A" and x >= FIELD_W - 0.5 and in_goal_mouth:
-            self.goal_scored("A")
-        elif owner.team == "B" and x <= 0.5 and in_goal_mouth:
-            self.goal_scored("B")
+        goal_line_x = self.opponent_goal(owner.team)[0]
+        if in_goal_mouth and abs(x - goal_line_x) <= 0.5:
+            self.goal_scored(owner.team)
 
     def goal_scored(self, team):
         self.score[team] += 1
-        self.log(f"BUT de l'equipe {team} ! Score A {self.score['A']} - "
-                 f"{self.score['B']} B")
+        self.log(f"BUT de {team} ! {self.score_text()}")
         self.kickoff()
 
     def kickoff(self):

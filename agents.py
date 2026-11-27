@@ -16,7 +16,7 @@ class PlayerAgent(mesa.Agent):
 
     def __init__(self, model, team, role, name, home):
         super().__init__(model)
-        self.team = team      # "A" ou "B"
+        self.team = team      # nom de l'equipe (voir LEFT_TEAM / RIGHT_TEAM)
         self.role = role      # "DEF", "MID", "ATT"
         self.name = name      # ex. "A2"
         self.home = home      # position de depart / zone naturelle
@@ -107,7 +107,7 @@ class PlayerAgent(mesa.Agent):
     def move_to_support_position(self, owner):
         """Se placer devant le porteur, decale sur le cote de sa zone."""
         self.last_action = "move_to_support_position"
-        forward = 10.0 if self.team == "A" else -10.0
+        forward = 10.0 * self.model.attack_direction(self.team)
         side = 8.0 if self.home[1] >= owner.pos[1] else -8.0
         self.move_toward((owner.pos[0] + forward, owner.pos[1] + side))
 
